@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sskvm</title>
+<link rel="icon" href="data:,">
+<style>
+  /* 克制：无圆角、无阴影、无渐变、无过渡特效 */
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd; overflow: hidden;
+               font: 13px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans SC", sans-serif; }
+  body { display: flex; flex-direction: column; }
+
+  #fit { flex: 1; min-height: 0; display: flex; align-items: flex-start; justify-content: center; }
+  #box { display: flex; flex-direction: column; }
+  #cv { display: block; background: #000; cursor: crosshair; }
+
+  #foot { padding: 26px 8px 6px; }
+  #brand { display: inline-block; color: #fff; text-decoration: none; padding: 0 4px;
+           font: 700 18px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans SC", sans-serif;
+           letter-spacing: .04em; }
+  #brand:hover { background: #222; }
+  #status { display: flex; align-items: center; gap: 12px; margin-top: 2px;
+            white-space: nowrap;
+            font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  #dot { color: #c00; }
+  #dot.ok { color: #0c0; }
+  #hud { color: #777; }
+  #menuBtn { background: none; border: 0; color: #999; cursor: pointer; font: inherit; padding: 0 2px; }
+  #menuBtn:hover { color: #fff; }
+
+  /* 覆盖层：连接中 / 无信号 / 被占用 / 认证失败（画面区域之上，不挡底栏） */
+  #overlay { position: fixed; inset: 0 0 74px 0; display: none; align-items: center;
+             justify-content: center; flex-direction: column; gap: 14px; background: #000c; }
+  #overlay.on { display: flex; }
+  #ovText { color: #bbb; font-size: 14px; }
+  #ovForm { display: none; gap: 8px; }
+  #ovForm.on { display: flex; }
+  #ovToken { width: 22ch; padding: 6px 8px; background: #000; border: 1px solid #333; color: #ddd;
+             outline: none; font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  #ovBtn, #ovSave { padding: 6px 16px; background: #1c1c1c; border: 1px solid #333; color: #ddd;
+                    cursor: pointer; font: 12px/1.6 inherit; }
+  #ovBtn:hover, #ovSave:hover { background: #2a2a2a; }
+  #ovBtn[hidden] { display: none; }
+
+  dialog { position: relative; padding: 0; border: 1px solid #333; background: #0d0d0d; color: #ddd;
+           width: 560px; max-width: 94vw; }
+  dialog::backdrop { background: #000a; }
+  #closeMenu { position: absolute; top: 4px; right: 4px; width: 24px; height: 24px;
+               background: none; border: 0; color: #999; cursor: pointer; font: 16px/1 sans-serif; }
+  #closeMenu:hover { color: #fff; }
+  #menuBody { padding: 20px 24px; }
+  .row { margin-bottom: 14px; }
+  .row label { display: block; margin-bottom: 4px; color: #999; font-size: 12px; }
+  .inline { display: flex; gap: 8px; }
+  .inline input { width: 16ch; padding: 6px 8px; background: #000; border: 1px solid #333;
+                  color: #ddd; outline: none;
+                  font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .inline input:focus { border-color: #666; }
+  button.act { flex: none; padding: 6px 14px; background: #1c1c1c; border: 1px solid #333;
+               color: #ddd; cursor: pointer; font: 12px/1.6 inherit; }
+  button.act:hover { background: #2a2a2a; }
+  .seg { display: inline-flex; }
+  .seg button { padding: 6px 18px; background: none; border: 0; color: #999; cursor: pointer;
+                font: 13px/1.6 inherit; }
+  .seg button:hover { color: #ddd; }
+  .seg button.on { background: #1c1c1c; color: #fff; }
+  dl { display: grid; grid-template-columns: 72px 1fr; gap: 4px 12px; margin: 18px 0 0;
+       font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  dt { color: #999; }
+  dd { margin: 0; }
+  #hint { margin: 12px 0 0; min-height: 1.4em; color: #999; font-size: 12px; }
+  button:focus, a:focus, input:focus { outline: none; }
+</style>
+</head>
+<body>
+<div id="fit">
+  <div id="box">
+    <canvas id="cv" width="1280" height="720"></canvas>
+    <div id="foot">
+      <a id="brand" href="https://github.com/netube99/sskvm" target="_blank" rel="noopener noreferrer">SSKVM</a>
+      <div id="status">
+        <span id="conn"><span id="dot">●</span> <span id="connText">连接中…</span></span>
+        <span id="hud"></span>
+        <button id="menuBtn">设置</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="overlay">
+  <div id="ovText"></div>
+  <div id="ovForm"><input id="ovToken" placeholder="访问 token" autocomplete="off" spellcheck="false"><button id="ovSave">连接</button></div>
+  <button id="ovBtn" hidden>重试</button>
+</div>
+
+<dialog id="menu">
+  <button id="closeMenu" aria-label="关闭">×</button>
+  <div id="menuBody">
+    <div class="row">
+      <label for="host">主机名</label>
+      <div class="inline">
+        <input id="host" pattern="[a-z0-9-]{1,32}" autocomplete="off" spellcheck="false">
+        <button class="act" id="saveHost">修改</button>
+      </div>
+    </div>
+    <div class="row">
+      <label>分辨率</label>
+      <div class="seg" id="resSeg">
+        <button data-res="0">480P</button>
+        <button data-res="1">720P</button>
+        <button data-res="2">1080P</button>
+      </div>
+    </div>
+    <dl>
+      <dt>IP</dt><dd id="vIp">-</dd>
+      <dt>MAC</dt><dd id="vMac">-</dd>
+      <dt>版本</dt><dd id="vVer">-</dd>
+    </dl>
+    <p id="hint"></p>
+  </div>
+</dialog>
+
+<script>
+"use strict";
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d', { alpha: false, desynchronized: true });
+const dot = document.getElementById('dot');
+const connText = document.getElementById('connText');
+const hud = document.getElementById('hud');
+const menu = document.getElementById('menu');
+const hint = document.getElementById('hint');
+const overlay = document.getElementById('overlay');
+const ovText = document.getElementById('ovText');
+const ovBtn = document.getElementById('ovBtn');
+const ovForm = document.getElementById('ovForm');
+const ovToken = document.getElementById('ovToken');
+
+const RES_DIM = [[640, 480], [1280, 720], [1920, 1080]];
+
+if (!('VideoDecoder' in window)) {
+  setStatus('需要 HTTPS + WebCodecs', false);
+  showOverlay('unsupported', '这个浏览器不支持 WebCodecs，请用 Chrome/Edge 并通过 https 访问');
+  throw new Error('WebCodecs unavailable');
+}
+
+// ---------------- 连接 ----------------
+const TOKEN = new URLSearchParams(location.search).get('token') ||
+              sessionStorage.getItem('sskvm_token') || '';
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host +
+               '/ws' + (TOKEN ? '?token=' + encodeURIComponent(TOKEN) : '');
+
+let ws = null, attempts = 0, retryTimer = 0, hbTimer = 0;
+let ovKind = '';
+let connGen = 0;                      // 连接代号：旧 socket 的异步回调不许动新连接的 UI
+let pingSent = 0, clockK = null;      // clockK = 设备时钟 - 浏览器时钟（由 pong 估出）
+
+function setStatus(text, ok) {
+  connText.textContent = text;
+  dot.classList.toggle('ok', !!ok);
+}
+
+function showOverlay(kind, text, btn) {
+  ovKind = kind;
+  ovText.textContent = text;
+  ovBtn.hidden = !btn;
+  ovBtn.textContent = btn || '重试';
+  ovForm.classList.toggle('on', kind === 'auth');
+  overlay.classList.add('on');
+}
+function hideOverlay() { ovKind = ''; overlay.classList.remove('on'); }
+
+function send(u8) {
+  if (ws && ws.readyState === 1) ws.send(u8);
+}
+
+function connect() {
+  if (document.hidden || ovKind === 'busy' || ovKind === 'auth') return;
+  clearTimeout(retryTimer);
+  resetDecoder();
+  const gen = ++connGen;
+  const sock = new WebSocket(WS_URL);
+  ws = sock;
+  sock.binaryType = 'arraybuffer';
+  sock.onopen = () => {
+    if (gen !== connGen) { try { sock.close(); } catch (e) {} return; }
+    attempts = 0;
+    lastRx = performance.now();
+    hideOverlay();
+    setStatus('已连接，等待画面…', false);
+    clearInterval(hbTimer);
+    hbTimer = setInterval(() => { pingSent = performance.now(); send(new Uint8Array([0x05])); }, 5000);
+  };
+  sock.onmessage = onMessage;
+  sock.onerror = () => {};
+  sock.onclose = () => {
+    if (gen !== connGen) return;      // 已经被新连接取代
+    clearInterval(hbTimer);
+    hbTimer = 0;
+    resetDecoder();
+    drop(gen);
+  };
+}
+
+// WS 握手失败时浏览器只给 1006，分不清 401 / 409 / 网络断。
+// 用 /config 探一下：它是普通 HTTP，状态码看得见。
+async function probe() {
+  try {
+    const r = await fetch('/config', { headers: TOKEN ? { 'X-Auth-Token': TOKEN } : {} });
+    if (r.status === 401) return 'auth';
+    if (!r.ok) return 'error';
+    const c = await r.json();
+    updateInfo(c);
+    return c.wsBusy ? 'busy' : 'ok';
+  } catch (e) {
+    return 'error';
+  }
+}
+
+async function drop(gen) {
+  const st = await probe();
+  if (gen !== connGen) return;        // probe 期间已经重连上了，别再弹旧覆盖层
+  if (st === 'auth') {
+    setStatus('认证失败', false);
+    showOverlay('auth', '需要访问 token');
+    return;
+  }
+  if (st === 'busy') {
+    setStatus('被占用', false);
+    showOverlay('busy', '设备已被另一个浏览器占用', '重试');
+    return;
+  }
+  const base = Math.min(8000, 500 * Math.pow(2, attempts++));
+  const delay = Math.round(base * (0.5 + Math.random() * 0.5));
+  setStatus(`已断开，${(delay / 1000).toFixed(1)}s 后重连…`, false);
+  if (ovKind !== 'signal') showOverlay('down', '连接断开', '立即重试');
+  retryTimer = setTimeout(connect, delay);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    // 切走就断开：释放独占槽位，也让设备停掉这个观众
+    clearTimeout(retryTimer);
+    if (ws) { try { ws.close(); } catch (e) {} }
+  } else if (ovKind !== 'busy' && ovKind !== 'auth') {
+    connect();
+  }
+});
+
+// ---------------- 视频：H264 over WebSocket + WebCodecs ----------------
+let dec = null, resync = false, idrT = 0;
+let curW = 0, curH = 0, lastRx = 0;
+let offset = Infinity, lat = 0;
+let fps = 0, frames = 0, lastFps = performance.now();
+let bytes = 0, bytesT = performance.now(), bps = 0;
+
+function resetDecoder() {
+  resync = false;
+  if (dec) { try { dec.close(); } catch (e) {} dec = null; }
+}
+
+function requestIdr() {
+  const now = performance.now();
+  if (now - idrT < 500) return;      // 限速：别把设备淹了
+  idrT = now;
+  resync = true;
+  send(new Uint8Array([0x04]));
+}
+
+function firstNalType(d) {
+  for (let i = 0; i + 3 < d.length && i < 64; i++) {
+    if (d[i] === 0 && d[i + 1] === 0 && d[i + 2] === 1) return d[i + 3] & 0x1f;
+  }
+  return -1;
+}
+
+function findSps(d) {
+  for (let i = 0; i + 4 < d.length; i++) {
+    if (d[i] === 0 && d[i + 1] === 0 && d[i + 2] === 1 && (d[i + 3] & 0x1f) === 7) {
+      return d.subarray(i + 3);
+    }
+  }
+  return null;
+}
+
+function codecString(sps) {
+  const h = b => b.toString(16).padStart(2, '0');
+  return `avc1.${h(sps[1])}${h(sps[2])}${h(sps[3])}`;
+}
+
+function onDecodeError(e) {
+  console.error('decoder', e);
+  if (dec) { try { dec.close(); } catch (x) {} dec = null; }
+  requestIdr();
+}
+
+function drawFrame(frame) {
+  if (cv.width !== frame.displayWidth || cv.height !== frame.displayHeight) {
+    cv.width = frame.displayWidth;
+    cv.height = frame.displayHeight;
+    fit();
+  }
+  ctx.drawImage(frame, 0, 0);
+  frame.close();
+  // 分辨率真的变了才算切换完成（以画面为准，不信状态事件）
+  if (wantRes >= 0 && frame.displayWidth === RES_DIM[wantRes][0] &&
+      frame.displayHeight === RES_DIM[wantRes][1]) {
+    wantRes = -1;
+  }
+  if (++frames >= 30) {
+    const now = performance.now();
+    fps = Math.round(frames * 1000 / (now - lastFps));
+    frames = 0; lastFps = now;
+    bps = Math.round(bytes * 8 * 1000 / (now - bytesT));
+    bytes = 0; bytesT = now;
+    updateHud();
+  }
+}
+
+function onVideo(buf) {
+  if (buf.length < 9) return;
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const pts = dv.getUint32(0, true);
+  const w = dv.getUint16(4, true), h = dv.getUint16(6, true);
+  const data = buf.subarray(8);
+  const now = performance.now();
+  lastRx = now;
+  bytes += buf.length;
+  // 端到端延时：设备单调时钟 vs 本地时钟，用最小值估偏移（不需要对表）
+  const off = now - pts;
+  if (clockK !== null) {
+    lat = Math.round(off + clockK);       // 真实单向延时（pong 估过时钟差）
+  } else {
+    if (off < offset) offset = off;       // 还没 pong：先当抖动看
+    lat = Math.round(off - offset);
+  }
+
+  if (w && h && (w !== curW || h !== curH)) {   // 分辨率变了：重建解码器
+    curW = w; curH = h;
+    resetDecoder();
+  }
+
+  const nal = firstNalType(data);
+  const key = nal === 5 || nal === 7;
+  if (resync) {
+    if (!key) return;                           // 等关键帧
+    resync = false;
+    if (dec) { try { dec.close(); } catch (e) {} dec = null; }
+  }
+  if (!dec) {
+    if (!key) { requestIdr(); return; }
+    const sps = findSps(data);
+    if (!sps) { requestIdr(); return; }
+    dec = new VideoDecoder({ output: drawFrame, error: onDecodeError });
+    dec.configure({ codec: codecString(sps), avc: { format: 'annexb' }, optimizeForLatency: true });
+  }
+  if (dec.decodeQueueSize > 2) {                // 解码排队了：丢到下一个关键帧
+    requestIdr();
+    return;
+  }
+  try {
+    dec.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: pts * 1000, data }));
+  } catch (e) {
+    onDecodeError(e);
+  }
+}
+
+// ---------------- 状态事件 ----------------
+let wantRes = -1, resT0 = 0, curRes = -1;
+
+function onMessage(ev) {
+  if (typeof ev.data === 'string') {
+    let m;
+    try { m = JSON.parse(ev.data); } catch (e) { return; }
+    lastRx = performance.now();
+    if (m.t === 'pong') {
+      // 用 pong 里的设备时钟估时钟差（假设 RTT 对称）：单向延时 = now - pts + K
+      if (m.d !== undefined && pingSent) {
+        const rtt = performance.now() - pingSent;
+        clockK = m.d - (pingSent + rtt / 2);
+      }
+      return;
+    }
+    if (m.t !== 'state') return;
+    if (m.res !== undefined) {
+      curRes = m.res;
+      if (wantRes < 0) setResUI(curRes);
+    }
+    if (m.signal === 0) {
+      showOverlay('signal', '无信号（采集卡未连接）');
+    } else if (ovKind === 'signal') {
+      hideOverlay();
+    }
+    if (ovKind === 'down' || ovKind === '') setStatus('已连接', true);
+    return;
+  }
+  onVideo(new Uint8Array(ev.data));
+}
+
+function updateHud() {
+  hud.textContent = `${cv.width}x${cv.height} ${fps}fps ${(bps / 1e6).toFixed(1)}Mbps ${lat}ms`;
+}
+
+// 心跳/视频都断了 12s 就当连接死了（关掉触发 onclose → 重连）
+setInterval(() => {
+  if (ws && ws.readyState === 1 && performance.now() - lastRx > 12000) {
+    try { ws.close(); } catch (e) {}
+  }
+}, 3000);
+
+// ---------------- 尺寸 ----------------
+function fit() {
+  const footH = document.getElementById('foot').offsetHeight;
+  const s = Math.min(window.innerWidth / cv.width,
+                     (window.innerHeight - footH - 12) / cv.height);
+  const w = Math.max(1, Math.floor(cv.width * s));
+  const h = Math.max(1, Math.floor(cv.height * s));
+  document.getElementById('box').style.width = w + 'px';
+  cv.style.width = w + 'px';
+  cv.style.height = h + 'px';
+}
+window.addEventListener('resize', fit);
+
+// ---------------- 键盘 → HID boot keyboard ----------------
+const HID = {
+  Escape:0x29, Backquote:0x35, Digit1:0x1e, Digit2:0x1f, Digit3:0x20, Digit4:0x21,
+  Digit5:0x22, Digit6:0x23, Digit7:0x24, Digit8:0x25, Digit9:0x26, Digit0:0x27,
+  Minus:0x2d, Equal:0x2e, Backspace:0x2a, Tab:0x2b, KeyQ:0x14, KeyW:0x1a, KeyE:0x08,
+  KeyR:0x15, KeyT:0x17, KeyY:0x1c, KeyU:0x18, KeyI:0x0c, KeyO:0x12, KeyP:0x13,
+  BracketLeft:0x2f, BracketRight:0x30, Backslash:0x31, CapsLock:0x39, KeyA:0x04,
+  KeyS:0x16, KeyD:0x07, KeyF:0x09, KeyG:0x0a, KeyH:0x0b, KeyJ:0x0d, KeyK:0x0e,
+  KeyL:0x0f, Semicolon:0x33, Quote:0x34, Enter:0x28, KeyZ:0x1d, KeyX:0x1b, KeyC:0x06,
+  KeyV:0x19, KeyB:0x05, KeyN:0x11, KeyM:0x10, Comma:0x36, Period:0x37, Slash:0x38,
+  Space:0x2c, ContextMenu:0x65, Insert:0x49, Home:0x4a, PageUp:0x4b, Delete:0x4c,
+  End:0x4d, PageDown:0x4e, ArrowRight:0x4f, ArrowLeft:0x50, ArrowDown:0x51, ArrowUp:0x52,
+  NumLock:0x53, NumpadDivide:0x54, NumpadMultiply:0x55, NumpadSubtract:0x56,
+  NumpadAdd:0x57, NumpadEnter:0x58, Numpad1:0x59, Numpad2:0x5a, Numpad3:0x5b,
+  Numpad4:0x5c, Numpad5:0x5d, Numpad6:0x5e, Numpad7:0x5f, Numpad8:0x60, Numpad9:0x61,
+  Numpad0:0x62, NumpadDecimal:0x63, PrintScreen:0x46, ScrollLock:0x47, Pause:0x48,
+  F1:0x3a, F2:0x3b, F3:0x3c, F4:0x3d, F5:0x3e, F6:0x3f, F7:0x40, F8:0x41,
+  F9:0x42, F10:0x43, F11:0x44, F12:0x45,
+};
+const MODS = { ControlLeft:0x01, ShiftLeft:0x02, AltLeft:0x04, MetaLeft:0x08,
+               ControlRight:0x10, ShiftRight:0x20, AltRight:0x40, MetaRight:0x80 };
+let mods = 0;
+const keys = [];
+
+function sendKbd(extraMods) {
+  const m = new Uint8Array(8);
+  m[0] = 0x01; m[1] = mods | (extraMods || 0);
+  for (let i = 0; i < 6; i++) m[2 + i] = keys[i] || 0;
+  send(m);
+}
+
+// 自动化工具（CDP/Playwright）合成 Ctrl+U 时只发一个 ctrlKey=true 的 keydown，
+// 没有单独的 ControlLeft 事件；只认物理键会把 Ctrl+U 变成普通字符 u。
+function flagMods(e) {
+  return (e.ctrlKey ? 0x01 : 0) | (e.shiftKey ? 0x02 : 0) |
+         (e.altKey ? 0x04 : 0) | (e.metaKey ? 0x08 : 0);
+}
+
+window.addEventListener('keydown', e => {
+  if (menu.open) return;                      // 设置面板里打字不发到被控机
+  e.preventDefault();
+  if (e.repeat) return;
+  const u = HID[e.code];
+  if (MODS[e.code] !== undefined) mods |= MODS[e.code];
+  else if (u && !keys.includes(u) && keys.length < 6) keys.push(u);
+  sendKbd(flagMods(e));
+});
+window.addEventListener('keyup', e => {
+  if (menu.open) return;
+  e.preventDefault();
+  const u = HID[e.code];
+  if (MODS[e.code] !== undefined) mods &= ~MODS[e.code];
+  else { const i = keys.indexOf(u); if (i >= 0) keys.splice(i, 1); }
+  sendKbd();
+});
+window.addEventListener('blur', releaseAll);
+
+// ---------------- 鼠标 → 绝对鼠标 ----------------
+let buttons = 0, wheelAcc = 0, pending = null, rafId = 0;
+let lastX = 16384, lastY = 16384;
+
+function releaseAll() {
+  mods = 0; keys.length = 0; buttons = 0;
+  sendKbd(); sendMouse();
+}
+
+function videoToAbs(clientX, clientY) {
+  const r = cv.getBoundingClientRect();
+  const s = Math.min(r.width / cv.width, r.height / cv.height);
+  const dw = cv.width * s, dh = cv.height * s;
+  const ox = r.left + (r.width - dw) / 2, oy = r.top + (r.height - dh) / 2;
+  const nx = Math.min(1, Math.max(0, (clientX - ox) / dw));
+  const ny = Math.min(1, Math.max(0, (clientY - oy) / dh));
+  return [Math.round(nx * 32767), Math.round(ny * 32767)];
+}
+
+function sendMouse(x = lastX, y = lastY) {
+  lastX = x; lastY = y;
+  const m = new Uint8Array(7);
+  m[0] = 0x02; m[1] = buttons;
+  m[2] = x & 0xff; m[3] = x >> 8; m[4] = y & 0xff; m[5] = y >> 8;
+  m[6] = wheelAcc & 0xff;
+  wheelAcc = 0;
+  send(m);
+}
+
+function flushMove() {
+  rafId = 0;
+  if (!pending) return;
+  const [x, y] = videoToAbs(pending.x, pending.y);
+  pending = null;
+  sendMouse(x, y);
+}
+
+cv.addEventListener('mousemove', e => {
+  pending = { x: e.clientX, y: e.clientY };
+  if (!rafId) rafId = requestAnimationFrame(flushMove);   // 每帧最多一条
+});
+cv.addEventListener('mousedown', e => {
+  e.preventDefault();
+  buttons |= { 0: 1, 2: 2, 1: 4 }[e.button] || 0;
+  const [x, y] = videoToAbs(e.clientX, e.clientY);
+  sendMouse(x, y);
+});
+window.addEventListener('mouseup', e => {
+  if (menu.open) return;
+  buttons &= ~({ 0: 1, 2: 2, 1: 4 }[e.button] || 0);
+  const [x, y] = videoToAbs(e.clientX, e.clientY);
+  sendMouse(x, y);
+});
+cv.addEventListener('contextmenu', e => e.preventDefault());
+window.addEventListener('wheel', e => {
+  if (menu.open) return;
+  e.preventDefault();
+  wheelAcc += Math.sign(e.deltaY);
+  wheelAcc = Math.max(-127, Math.min(127, wheelAcc));
+  if (wheelAcc) sendMouse();
+}, { passive: false });
+
+// ---------------- 设置 ----------------
+const resBtns = [...document.querySelectorAll('#resSeg button')];
+
+function setResUI(idx) {
+  resBtns.forEach(b => b.classList.toggle('on', Number(b.dataset.res) === idx));
+}
+
+resBtns.forEach(b => b.onclick = () => {
+  const idx = Number(b.dataset.res);
+  if (idx === curRes) return;
+  setResUI(idx);
+  wantRes = idx;
+  setTimeout(() => { if (wantRes === idx) { wantRes = -1; } }, 20000);
+  send(new Uint8Array([0x06, idx]));        // 走 WS，不用另开连接
+});
+
+function updateInfo(c) {
+  if (c.hostname) document.getElementById('host').value = c.hostname;
+  document.getElementById('vIp').textContent = c.ip || '-';
+  document.getElementById('vMac').textContent = c.mac || '-';
+  document.getElementById('vVer').textContent = c.version || '-';
+  if (c.res !== undefined) { curRes = c.res; if (wantRes < 0) setResUI(c.res); }
+}
+
+document.getElementById('saveHost').onclick = async () => {
+  const name = document.getElementById('host').value.trim();
+  const r = await fetch('/config', {
+    method: 'POST',
+    headers: TOKEN ? { 'X-Auth-Token': TOKEN } : {},
+    body: 'hostname=' + encodeURIComponent(name),
+  });
+  hint.textContent = r.ok ? '已保存' : ('失败：' + await r.text());
+};
+
+document.getElementById('menuBtn').onclick = () => {
+  releaseAll();                             // 面板打开后不再转发输入
+  hint.textContent = '';
+  menu.showModal();
+  document.getElementById('host').focus();  // 焦点别停在关闭按钮上（Enter 会误关弹窗）
+};
+document.getElementById('closeMenu').onclick = () => menu.close();
+menu.addEventListener('keydown', e => { if (e.key === 'Enter') e.preventDefault(); });
+
+// ---------------- 覆盖层按钮 ----------------
+ovBtn.onclick = () => {
+  hideOverlay();
+  attempts = 0;
+  connect();
+};
+document.getElementById('ovSave').onclick = () => {
+  const t = ovToken.value.trim();
+  if (t) {
+    sessionStorage.setItem('sskvm_token', t);
+    location.reload();
+  }
+};
+ovToken.addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('ovSave').click(); });
+
+// ---------------- 启动 ----------------
+fit();
+(async () => {
+  const st = await probe();                  // 先探一次：busy/auth 直接给出明确提示
+  if (st === 'auth') {
+    setStatus('认证失败', false);
+    showOverlay('auth', '需要访问 token');
+    return;
+  }
+  if (st === 'busy') {
+    setStatus('被占用', false);
+    showOverlay('busy', '设备已被另一个浏览器占用', '重试');
+    return;
+  }
+  connect();
+})();
+</script>
+</body>
+</html>

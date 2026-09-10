@@ -1,0 +1,5 @@
+dependencies:
+  espressif/esp_tinyusb: "*"
+  espressif/usb: "^1.5.0"
+  espressif/esp_h264: "^1.4.0"
+  espressif/mdns: "*"

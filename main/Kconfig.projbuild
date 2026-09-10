@@ -1,0 +1,45 @@
+menu "SSKVM"
+
+    config SSKVM_VIDEO_TEST_PATTERN
+        bool "Use synthetic test pattern instead of UVC camera"
+        default n
+        help
+            Generates a moving pattern, skips USB host/UVC.
+            Used to validate the H264 path without the capture card.
+
+    choice SSKVM_VIDEO_DEFAULT_RES
+        prompt "Default resolution"
+        default SSKVM_RES_720P
+        help
+            可在网页设置里运行时切换；这里只是首次开机的默认值。
+
+        config SSKVM_RES_480P
+            bool "480P (640x480)"
+        config SSKVM_RES_720P
+            bool "720P (1280x720)"
+        config SSKVM_RES_1080P
+            bool "1080P (1920x1080)"
+    endchoice
+
+    config SSKVM_VIDEO_BITRATE
+        int "H264 bitrate (bps)"
+        default 8000000
+        help
+            码控目标码率（也是上限，静止画面实测远低于此）。
+            720P 35fps 下 8Mbps ≈ 28KB/帧；局域网可以再往上加。
+
+    config SSKVM_SNTP_SERVER
+        string "SNTP server"
+        default "pool.ntp.org"
+        help
+            TLS 证书有效期校验需要正确时钟；局域网里指向本地 NTP。
+
+    config SSKVM_AUTH_TOKEN
+        string "Access token (empty = no auth)"
+        default ""
+        help
+            If non-empty, every HTTP/WS request must carry ?token=<value>
+            or the X-Auth-Token header. Set this before exposing the device
+            to an untrusted network.
+
+endmenu

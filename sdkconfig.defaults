@@ -1,0 +1,68 @@
+# sskvm：UVC 采集 + JPEG 硬解 + H264 硬编 + USB HID + 自持 HTTPS/WSS 传输层。
+# 传输层不用 esp_http_server：每连接一个任务独占自己的 TLS 上下文（见 main/net_server.c）。
+
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# 自定义分区表
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# 复合设备：HID 键盘 + 绝对鼠标（MSC/CDC 已删）
+CONFIG_TINYUSB_CDC_ENABLED=n
+CONFIG_TINYUSB_MSC_ENABLED=n
+CONFIG_TINYUSB_HID_COUNT=2
+# DWC2 设备栈必须用 SLAVE 模式：DMA 模式的 setup_phase_done 路径信任
+# DOEPDMA0-8 指向 setup 缓冲，EP0 状态机残留时寄存器读回 8 → setup_packet=NULL
+# → memcpy 地址 0 → Load access fault panic（容器 libusb 控制传输 100% 复现）。
+# HID 1ms/8B 报表对 slave 模式无压力。
+CONFIG_TINYUSB_MODE_SLAVE=y
+
+# PSRAM：ESP32-P4NRW32X 32MB hex @200MHz，视频管线必需（H264 例程同款配置）
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+
+# 以太网：板载 IP101G RMII（GPIO28-35/49/50/52，复位 GPIO51）
+CONFIG_ETH_ENABLED=y
+CONFIG_ETH_USE_ESP32_EMAC=y
+# P4 EMAC 驱动是拷贝式发送：一个帧占 ceil(len/BUFFER_SIZE) 个 TX 描述符。
+# 默认 512B × 10 个 ≈ 只能排 3 帧，90KB 的 IDR 突发会 ENOBUFS。
+CONFIG_ETH_DMA_BUFFER_SIZE=1600
+CONFIG_ETH_DMA_TX_BUFFER_NUM=10
+
+# USB Host + UVC：UVC 的配置描述符很大（几 KB），256B 控制传输缓冲会枚举失败
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=3000
+CONFIG_USB_HOST_HW_BUFFER_BIAS_IN=y
+# 这颗采集卡是 UVC 1.0，payload header 的 EOH 位是保留位（不置 1），
+# 驱动默认检查 EOH 会把每包都丢掉 → frame 0 B
+CONFIG_UVC_CHECK_PAYLOAD_HEADER_EOH=n
+
+# TLS（自持 esp_tls server）：证书/密钥用构建期生成的 ECDSA P-256。
+CONFIG_ESP_TLS_SERVER=y
+# 硬件 MPI（bignum）在 P4 上会挂死：多次 TLS 会话后 mpi_hal_enable_hardware_hw_op()
+# 在 RSA_QUERY_CLEAN_REG 上死等。ECDSA 握手主力是 ECC 外设，关掉只影响少数 bignum。
+CONFIG_MBEDTLS_HARDWARE_MPI=n
+# TLS 缓冲必须放内部 RAM：AES-GCM 硬件引擎只认 DMA 可用内存，PSRAM 会退化成软件
+# 实现（实测 5.4 vs 53 MB/s，/snapshot 吞吐差一倍）。代价是每会话 ~30KB 内部 RAM。
+# CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC is not set
+CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=y
+
+# 1ms tick：HID 任务需要 2ms 调度精度（HZ=100 时 pdMS_TO_TICKS(2)=0）
+CONFIG_FREERTOS_HZ=1000
+# 任务忙等卡死时自动重启，别等人断电
+CONFIG_ESP_TASK_WDT_PANIC=y
+
+# 传输层：1 个 WS 会话 + 最多 3 个 HTTP 会话（agent keep-alive + 页面）
+CONFIG_LWIP_MAX_SOCKETS=16
+# 大帧走 TLS：默认 5760B 发送窗口会把 100KB 帧拖慢
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+CONFIG_LWIP_TCP_WND_DEFAULT=16384
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+
+# 大帧走 TLS：默认 4KB 记录会把 30KB 的帧拆成 8 条 TLS 记录
+CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
+# 收只收键鼠/HTTP 请求（≤1KB），收缓冲降到 4KB：省 12KB/会话的内部 RAM，
+# 否则 TLS 缓冲会把内部堆切碎，1080P 编码器要 135KB 连续块就分不到
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=16384

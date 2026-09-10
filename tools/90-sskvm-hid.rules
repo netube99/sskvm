@@ -1,0 +1,8 @@
+# sskvm: P4 复合 HID 设备（303a:4008/400a）的键盘/鼠标接口宿主机内核不得驱动。
+# 内核在枚举瞬间绑 usbhid，此规则随后立刻解绑；窗口期内 P4 不发任何报表
+# （报表只在容器侧压测注入，注入前 hid_test.py 会先校验无内核占用）。
+# 不能用 authorized=0：那会连接口注册都删掉，容器 libusb 无法 claim。
+# ATTRS{}：接口节点自身没有 idVendor，要向父设备匹配。
+# add|change：真实枚举是 add；对在线设备 udevadm trigger 重放是 change。
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{bInterfaceClass}=="03", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="4008", RUN+="/usr/local/sbin/sskvm-hid-isolate %k"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{bInterfaceClass}=="03", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="400a", RUN+="/usr/local/sbin/sskvm-hid-isolate %k"

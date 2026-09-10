@@ -1,0 +1,4 @@
+FROM espressif/idf:v6.0.3
+RUN /opt/esp/python_env/idf6.0_py3.12_env/bin/python -m pip install --no-cache-dir pyusb
+COPY tools/hid_test.py /opt/hid_test.py
+ENTRYPOINT ["/opt/esp/python_env/idf6.0_py3.12_env/bin/python", "/opt/hid_test.py"]
