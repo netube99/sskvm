@@ -8,7 +8,7 @@
 |---|---|---|---|
 | GET | `/` | 否 | 单文件前端页面（不鉴权，token 错了页面才有机会提示输入） |
 | GET | `/config` | 是 | 设备状态 JSON |
-| POST | `/config` | 是 | `res=0/1/2` 或 `hostname=<名字>` |
+| POST | `/config` | 是 | `res=0/1/2`、`hostname=<名字>` 或 `uvc=restart`（重启采集卡流） |
 | GET | `/snapshot.jpg` | 是 | 采集卡原始 JPEG（最新一帧，给 agent） |
 | POST | `/input` | 是 | body = 二进制键鼠事件（见下） |
 | POST | `/type` | 是 | body = UTF-8 文本，P4 拆成 HID 按键；队列满返回已收字符数 |
@@ -23,6 +23,9 @@
 
 `res` 0=480P 1=720P 2=1080P；`signal`=0 表示采集卡没在出帧；`wsBusy`=1 表示浏览器已占用。
 HTTP 响应支持 keep-alive（agent 连续拉图复用一条 TLS 连接），空闲 15s 自动关闭。
+
+`POST /config` 的 `uvc=restart`：关掉采集流并按**当前分辨率**重新协商、重开（~1s，WS 不断），
+用于采集卡拔插/抽风后画面异常的软件复位；成功回 `restarting`（异步）。
 
 ## WebSocket `/ws`
 

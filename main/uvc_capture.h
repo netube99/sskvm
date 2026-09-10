@@ -26,6 +26,9 @@ void      uvc_capture_set_format(uint16_t w, uint16_t h);  // 下次 open 生效
 // 调用前必须已归还所有 receive() 拿到的帧（驱动断言全帧已归还）
 esp_err_t uvc_capture_reconfigure(uint16_t w, uint16_t h);
 void      uvc_capture_close(void);
+// 请消费者（strip 任务）在安全点关流重开：拔插/抽风后状态不干净时的软件复位
+void      uvc_capture_request_restart(void);
+bool      uvc_capture_take_restart_request(void);       // 取出并清除请求（strip 任务专用）
 bool      uvc_capture_connected(void);
 bool      uvc_capture_receive(uvc_frame_t *out, uint32_t timeout_ms);  // 内部丢弃更旧的帧
 void      uvc_capture_release(const uvc_frame_t *f);    // 归还帧给驱动（每帧恰一次）

@@ -25,6 +25,7 @@ static QueueHandle_t s_frame_q;
 static SemaphoreHandle_t s_frame_mu;    // 串行化 frame_cb 与关流时的回收
 static volatile bool s_closing;
 static volatile bool s_connected;
+static volatile bool s_restart;    // 请求关流重开（设置页按钮 / 拔插后自愈）
 static uvc_host_stream_hdl_t s_stream;
 static uint8_t s_dev_addr, s_uvc_idx;
 static volatile uint32_t s_frames;      // 收到的帧计数（监督任务用）
@@ -139,6 +140,20 @@ void uvc_capture_set_format(uint16_t w, uint16_t h)
     s_stream_cfg.vs_format.fps = 0;             // 0 = 用采集卡默认（最高）帧率
 }
 
+void uvc_capture_request_restart(void)
+{
+    s_restart = true;
+}
+
+bool uvc_capture_take_restart_request(void)
+{
+    if (!s_restart) {
+        return false;
+    }
+    s_restart = false;
+    return true;
+}
+
 // 运行时换分辨率：驱动自己会 停流→probe/commit→重启，不关设备。
 // 用 close+open 的话，快速切换会撞上 USB 设备关闭/端点释放的竞态
 // （驱动 assert: usbh_dev_close num_ctrl_xfers_inflight / EP already allocated）。
@@ -147,6 +162,10 @@ esp_err_t uvc_capture_reconfigure(uint16_t w, uint16_t h)
     if (!s_stream) {
         return ESP_ERR_INVALID_STATE;
     }
+    // 记住目标格式：断线/抽风重开时 open 用的是它。忘了这一步，切到 1080P 后
+    // 拔插采集卡会用开机时的 720P 重开 —— 卡的 JPEG 是 720p、编码器按 1080p 读
+    // YUV，画面就成斜切的错位花屏（见 AGENTS §7）。
+    uvc_capture_set_format(w, h);
     uvc_host_stream_format_t fmt = {
         .format = UVC_VS_FORMAT_MJPEG,
         .h_res = w,

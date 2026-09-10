@@ -376,8 +376,13 @@ static esp_err_t config_post(const net_req_t *req, net_resp_t *resp, void *ctx)
         kvm_mdns_set_hostname(v);
         return ok_text(resp, "ok");
     }
+    if (strncmp(req->body, "uvc=restart", 11) == 0) {
+        // 设置页按钮：关流重开、按当前分辨率重新协商（拔插/抽风后画面异常的软件复位）
+        uvc_capture_request_restart();
+        return ok_text(resp, "restarting");
+    }
     resp->status = 400;
-    return ok_text(resp, "res= / hostname=");
+    return ok_text(resp, "res= / hostname= / uvc=restart");
 }
 
 static esp_err_t snapshot_get(const net_req_t *req, net_resp_t *resp, void *ctx)

@@ -379,6 +379,16 @@ esp_err_t video_pipeline_set_resolution(int idx)
     return ESP_OK;
 }
 
+// 调用方必须持有 s_dec_mu：把待硬解的原始帧还给驱动。关流/换格式前必须先做，
+// 否则驱动发现“还有帧没还”就拒绝释放接口（`EP already allocated`，画面再也不回来）。
+static void raw_drain_locked(void)
+{
+    raw_ref_t j;
+    while (xQueueReceive(s_raw_q, &j, 0) == pdPASS) {
+        uvc_capture_release(&j.f);
+    }
+}
+
 // 在 strip 任务上下文重建（它持有 UVC 流与收帧；decode 被 s_dec_mu 挡在外面空手，
 // 编码任务经 s_enc_quit 退出——两个阻塞点都有短超时，不需要 poison 帧）
 static void pipeline_reconfigure(int idx)
@@ -390,10 +400,7 @@ static void pipeline_reconfigure(int idx)
     s_res_busy = true;
 
     xSemaphoreTake(s_dec_mu, portMAX_DELAY);
-    raw_ref_t j;                            // 旧分辨率的待解码帧退回驱动（新尺寸下解了也没用）
-    while (xQueueReceive(s_raw_q, &j, 0) == pdPASS) {
-        uvc_capture_release(&j.f);
-    }
+    raw_drain_locked();                     // 旧分辨率的待解码帧退回驱动（新尺寸下解了也没用）
     s_enc_quit = true;
     while (!s_enc_stopped) {
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -469,7 +476,12 @@ static void strip_task(void *arg)
             continue;
         }
         last_frame_us = esp_timer_get_time();
+        video_pipeline_force_idr();     // 新流的头几帧可能是断的/旧相位：从关键帧重新起步
         while (uvc_capture_connected()) {
+            if (uvc_capture_take_restart_request()) {
+                ESP_LOGW(TAG, "capture restart requested");
+                break;                  // 外层关流→按当前分辨率重开
+            }
             int idx = s_pending_res;        // 分辨率切换：安全点（手里无帧）重建
             if (idx >= 0) {
                 s_pending_res = -1;
@@ -517,6 +529,11 @@ static void strip_task(void *arg)
                 }
             }
         }
+        // 关流前保证没有任何帧在外面（decode 持帧时握着 s_dec_mu），否则 close 失败、
+        // 接口不释放（见 raw_drain_locked）
+        xSemaphoreTake(s_dec_mu, portMAX_DELAY);
+        raw_drain_locked();
+        xSemaphoreGive(s_dec_mu);
         uvc_capture_close();
     }
 }

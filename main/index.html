@@ -112,6 +112,12 @@
         <button data-res="2">1080P</button>
       </div>
     </div>
+    <div class="row">
+      <label>采集卡</label>
+      <div class="inline">
+        <button class="act" id="restartUvc">重启采集卡</button>
+      </div>
+    </div>
     <dl>
       <dt>IP</dt><dd id="vIp">-</dd>
       <dt>MAC</dt><dd id="vMac">-</dd>
@@ -572,6 +578,20 @@ document.getElementById('saveHost').onclick = async () => {
     body: 'hostname=' + encodeURIComponent(name),
   });
   hint.textContent = r.ok ? '已保存' : ('失败：' + await r.text());
+};
+
+document.getElementById('restartUvc').onclick = async () => {
+  hint.textContent = '正在重启采集卡…';
+  try {
+    const r = await fetch('/config', {
+      method: 'POST',
+      headers: TOKEN ? { 'X-Auth-Token': TOKEN } : {},
+      body: 'uvc=restart',
+    });
+    hint.textContent = r.ok ? '已重启，画面几秒后恢复' : ('失败：' + await r.text());
+  } catch (e) {
+    hint.textContent = '失败：连接断开';
+  }
 };
 
 document.getElementById('menuBtn').onclick = () => {
