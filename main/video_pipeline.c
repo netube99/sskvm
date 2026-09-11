@@ -25,6 +25,7 @@
 #include "esp_h264_alloc.h"
 #include "uvc_capture.h"
 #include "kvm_api.h"
+#include "kvm_config.h"
 #include "video_pipeline.h"
 
 static const char *TAG = "video";
@@ -55,13 +56,7 @@ static const struct {
 };
 #define RES_N (sizeof(RES) / sizeof(RES[0]))
 
-#if CONFIG_SSKVM_RES_480P
-#define DEFAULT_RES 0
-#elif CONFIG_SSKVM_RES_1080P
-#define DEFAULT_RES 2
-#else
-#define DEFAULT_RES 1
-#endif
+// 开机分辨率取 NVS 里的值（首次开机 = Kconfig 默认，同一套默认值在 kvm_config.c）
 
 // P4 H264 硬编输入是 "packed YUV420": 偶数行 u y y u y y...，奇数行 v y y v y y...
 // JPEG 硬解输出 JPEG_DECODE_OUT_FORMAT_YUV420 用的是同一个 fourcc，可直接对接。
@@ -78,7 +73,7 @@ typedef struct {
     uvc_frame_t f;          // 持有的驱动帧（必须恰好 uvc_capture_release 一次）
 } raw_ref_t;
 
-static int s_res = DEFAULT_RES;         // 当前分辨率索引
+static int s_res;                       // 当前分辨率索引（开机由 NVS 决定）
 static uint16_t s_w, s_h, s_align_h;
 static uint32_t s_yuv_size;
 
@@ -599,7 +594,8 @@ static void decode_task(void *arg)
 
 esp_err_t video_pipeline_start(void)
 {
-    set_res(DEFAULT_RES);
+    int boot_res = kvm_config_res();     // 上次设过的分辨率，重启后照旧（不用再点一次）
+    set_res(boot_res >= 0 && boot_res < (int)RES_N ? boot_res : 1);
     ESP_RETURN_ON_ERROR(codec_init(), TAG, "codec_init");
     ESP_RETURN_ON_ERROR(codec_alloc(), TAG, "codec_alloc");
     kvm_api_out_register(s_enc_buf[0] + OUT_HDR_PAD, s_enc_buf[1] + OUT_HDR_PAD, MAX_YUV_SIZE);

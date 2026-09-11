@@ -159,6 +159,16 @@ static void ws_open(void *ctx)
     ESP_LOGI(TAG, "browser attached");
 }
 
+// 改分辨率要落 NVS：重启后别再回到默认（resloop 压测直连管线，不写 NVS）
+static esp_err_t set_res_persist(int idx)
+{
+    esp_err_t e = video_pipeline_set_resolution(idx);
+    if (e == ESP_OK) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(kvm_config_set_res((uint8_t)idx));
+    }
+    return e;
+}
+
 static void ws_input(const uint8_t *data, size_t len, void *ctx)
 {
     if (len < 1) {
@@ -177,7 +187,7 @@ static void ws_input(const uint8_t *data, size_t len, void *ctx)
     }
     case 0x06:                          // 切分辨率（binary 一条搞定，设备端不解析 JSON）
         if (len >= 2) {
-            video_pipeline_set_resolution(data[1]);
+            set_res_persist(data[1]);
         }
         break;
     default:                            // 0x01 键盘 / 0x02 鼠标
@@ -357,8 +367,7 @@ static esp_err_t config_post(const net_req_t *req, net_resp_t *resp, void *ctx)
     }
     if (strncmp(req->body, "res=", 4) == 0) {
         int idx = atoi(req->body + 4);
-        esp_err_t e = video_pipeline_set_resolution(idx);
-        if (e != ESP_OK) {
+        if (set_res_persist(idx) != ESP_OK) {
             resp->status = 400;
             return ok_text(resp, "bad res");
         }
