@@ -44,15 +44,19 @@ static const char *TAG = "video";
 #define UVC_STALL_MS    10000   // 流开着但这么久没帧 → 关流重开（自愈）
 
 // 可选分辨率。fps 是管线实测能跑到的帧率，只用于 H264 码控：
-// RC 每帧预算 = bitrate / fps，填 60 会让 720P 实际只拿到 ~2.3Mbps（见 §码率）
+// RC 每帧预算 = bitrate / fps，填 60 会让 720P 实际只拿到 ~2.3Mbps（见 §码率）。
+// cap_fps 是向采集卡请求的帧率（0 = 卡的默认/最高）：卡的每一帧都要经过 USB DMA
+// 写进 PSRAM，管线跑不到的输出帧全部是白烧的 PSRAM 带宽（1080P 实测卡发 60fps、
+// 我们只编 22fps）。
 static const struct {
     uint16_t w, h;
     uint8_t fps;
+    uint8_t cap_fps;
     const char *name;
 } RES[] = {
-    { 640,  480,  60, "480P"  },
-    { 1280, 720,  46, "720P"  },
-    { 1920, 1080, 21, "1080P" },
+    { 640,  480,  60, 0,  "480P"  },
+    { 1280, 720,  46, 0,  "720P"  },
+    { 1920, 1080, 21, 30, "1080P" },
 };
 #define RES_N (sizeof(RES) / sizeof(RES[0]))
 
@@ -104,6 +108,8 @@ static volatile uint32_t s_idr_frames;      // IDR 帧计数
 static int64_t s_gate_us;                   // 等传输层消化上一帧的时间（编码任务空转）
 static int64_t s_last_idr_us;
 static int64_t s_enc_us, s_dec_us, s_wait_us, s_lat_us, s_lat_max;
+static int64_t s_enc_i_us;                  // IDR 帧的编码时间（诊断：和 P 帧分开看）
+static uint32_t s_enc_i_n, s_enc_p_n;
 static int64_t s_bufwait_us, s_strip_us;
 static uint32_t s_jpeg_bytes, s_enc_bytes;
 static uint32_t s_dec_fail;                 // 连续解码失败计数（日志限速用）
@@ -183,9 +189,15 @@ static void stats_log(void)
              s_enc_us / 1000.0 / STATS_N,
              s_jpeg_bytes / 1024.0 / STATS_N, s_enc_bytes / 1024.0 / STATS_N,
              (unsigned long)s_idr_frames, s_gate_us / 1000.0 / STATS_N);
+    // 编码时间按帧型拆开：IDR 是否拖慢均值一眼可见
+    ESP_LOGI(TAG, "enc split: P %.1fms x%lu | IDR %.1fms x%lu",
+             s_enc_p_n ? (s_enc_us - s_enc_i_us) / 1000.0 / s_enc_p_n : 0, (unsigned long)s_enc_p_n,
+             s_enc_i_n ? s_enc_i_us / 1000.0 / s_enc_i_n : 0, (unsigned long)s_enc_i_n);
     s_lat_us = s_wait_us = s_bufwait_us = s_strip_us = s_dec_us = s_enc_us = 0;
     s_jpeg_bytes = s_enc_bytes = s_lat_max = 0;
     s_gate_us = 0;
+    s_enc_i_us = 0;
+    s_enc_i_n = s_enc_p_n = 0;
 }
 
 // ---------------- 阶段3：YUV → H264 → 双输出缓冲（会话任务取去发） ----------------
@@ -246,6 +258,12 @@ static void encode_task(void *arg)
         if (eret == ESP_H264_ERR_OK) {
             int64_t t1 = esp_timer_get_time();
             s_enc_us += t1 - t0;
+            if (out.frame_type == ESP_H264_FRAME_TYPE_IDR) {
+                s_enc_i_us += t1 - t0;
+                s_enc_i_n++;
+            } else {
+                s_enc_p_n++;
+            }
             s_enc_bytes += out.length;
             s_enc_frames++;
             if (s_frame_cb) {
@@ -404,6 +422,7 @@ static void pipeline_reconfigure(int idx)
 
     codec_free();
     set_res(idx);
+    uint32_t iram_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     if (codec_alloc() != ESP_OK) {
         ESP_LOGE(TAG, "codec alloc failed (psram %u KB, iram %u KB largest %u KB), rebooting",
                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
@@ -414,12 +433,18 @@ static void pipeline_reconfigure(int idx)
     if (xTaskCreatePinnedToCore(encode_task, "encode", 4096, NULL, 10, NULL, 0) != pdPASS) {
         ESP_LOGE(TAG, "encode task create failed");
     }
+    // 诊断：ref/db 缓冲首选内部 RAM，分不到就退 PSRAM（退了对编码速度不利）
+    ESP_LOGW(TAG, "codec alloc: iram %lu -> %lu KB (delta %ld KB)",
+             (unsigned long)(iram_before / 1024),
+             (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (long)((iram_before - heap_caps_get_free_size(MALLOC_CAP_INTERNAL)) / 1024));
     xSemaphoreGive(s_dec_mu);
+    // 目标格式先记下（尺寸 + 卡帧率）：reconfigure 和后续 open 都读它
+    uvc_capture_set_format(s_w, s_h, RES[idx].cap_fps);
     // 不关流：驱动自己 停流→重新协商格式→重启，避开 USB 设备关闭/端点释放的竞态。
     // 此刻 strip 任务手里无帧（循环顶），驱动 format_select 里的全帧归还断言能过
     if (uvc_capture_reconfigure(s_w, s_h) != ESP_OK) {
         uvc_capture_close();
-        uvc_capture_set_format(s_w, s_h);   // 下次 open 用新尺寸
     }
     video_pipeline_force_idr();
     s_res_busy = false;
@@ -610,7 +635,7 @@ esp_err_t video_pipeline_start(void)
     }
 #else
     ESP_RETURN_ON_ERROR(uvc_capture_init(), TAG, "uvc_capture_init");
-    uvc_capture_set_format(s_w, s_h);
+    uvc_capture_set_format(s_w, s_h, RES[boot_res >= 0 && boot_res < (int)RES_N ? boot_res : 1].cap_fps);
     if (xTaskCreatePinnedToCore(strip_task, "strip", 4096, NULL, STRIP_TASK_PRIO, NULL, 1) != pdPASS ||
         xTaskCreatePinnedToCore(decode_task, "decode", 4096, NULL, DECODE_TASK_PRIO, NULL, 0) != pdPASS) {
         return ESP_ERR_NO_MEM;

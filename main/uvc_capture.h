@@ -21,7 +21,7 @@ typedef struct {
 
 esp_err_t uvc_capture_init(void);                       // USB host + UVC 驱动 + 事件任务
 esp_err_t uvc_capture_open(void);                       // 打开并启动流
-void      uvc_capture_set_format(uint16_t w, uint16_t h);  // 下次 open 生效（帧率用卡的默认/最高）
+void      uvc_capture_set_format(uint16_t w, uint16_t h, uint8_t fps);  // 下次 open 生效（fps=0 用卡的默认/最高）
 // 运行时换分辨率：不关设备，只停流→重新协商格式→重启（避免 close/open 的一堆驱动竞态）。
 // 调用前必须已归还所有 receive() 拿到的帧（驱动断言全帧已归还）
 esp_err_t uvc_capture_reconfigure(uint16_t w, uint16_t h);

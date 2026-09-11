@@ -26,6 +26,7 @@ static SemaphoreHandle_t s_frame_mu;    // 串行化 frame_cb 与关流时的回
 static volatile bool s_closing;
 static volatile bool s_connected;
 static volatile bool s_restart;    // 请求关流重开（设置页按钮 / 拔插后自愈）
+static uint8_t s_cap_fps;           // 请求的采集帧率（0 = 卡的默认/最高）
 static uvc_host_stream_hdl_t s_stream;
 static uint8_t s_dev_addr, s_uvc_idx;
 static volatile uint32_t s_frames;      // 收到的帧计数（监督任务用）
@@ -133,11 +134,12 @@ esp_err_t uvc_capture_init(void)
     return uvc_host_install(&drv_cfg);
 }
 
-void uvc_capture_set_format(uint16_t w, uint16_t h)
+void uvc_capture_set_format(uint16_t w, uint16_t h, uint8_t fps)
 {
     s_stream_cfg.vs_format.h_res = w;
     s_stream_cfg.vs_format.v_res = h;
-    s_stream_cfg.vs_format.fps = 0;             // 0 = 用采集卡默认（最高）帧率
+    s_stream_cfg.vs_format.fps = fps;           // 0 = 用采集卡默认（最高）帧率
+    s_cap_fps = fps;
 }
 
 void uvc_capture_request_restart(void)
@@ -165,12 +167,12 @@ esp_err_t uvc_capture_reconfigure(uint16_t w, uint16_t h)
     // 记住目标格式：断线/抽风重开时 open 用的是它。忘了这一步，切到 1080P 后
     // 拔插采集卡会用开机时的 720P 重开 —— 卡的 JPEG 是 720p、编码器按 1080p 读
     // YUV，画面就成斜切的错位花屏（见 AGENTS §7）。
-    uvc_capture_set_format(w, h);
+    uvc_capture_set_format(w, h, s_cap_fps);
     uvc_host_stream_format_t fmt = {
         .format = UVC_VS_FORMAT_MJPEG,
         .h_res = w,
         .v_res = h,
-        .fps = 0,
+        .fps = s_cap_fps,                  // 切分辨率也得带卡帧率，否则又协商回卡的最高帧率
     };
     // 1) 先把我们手里的帧全还给驱动。format_select 里的 uvc_format_save()
     //    断言所有帧都已在空队列里，手里还留着帧就会 assert 重启。
@@ -203,6 +205,13 @@ esp_err_t uvc_capture_open(void)
 {
     uvc_host_stream_hdl_t stream = NULL;
     esp_err_t err = uvc_host_stream_open(&s_stream_cfg, pdMS_TO_TICKS(5000), &stream);
+    if (err != ESP_OK && s_cap_fps) {
+        // 卡没有这个帧率档（驱动用 fabsf 精确匹配 descriptor）→ 退回卡的默认帧率，
+        // 别把流丢在打不开的状态（否则 5s 重试循环里永远出不了画面）
+        ESP_LOGW(TAG, "no %u fps mode (%s), retry at card default", s_cap_fps, esp_err_to_name(err));
+        uvc_capture_set_format(s_stream_cfg.vs_format.h_res, s_stream_cfg.vs_format.v_res, 0);
+        err = uvc_host_stream_open(&s_stream_cfg, pdMS_TO_TICKS(5000), &stream);
+    }
     if (err != ESP_OK) {
         usb_host_lib_info_t info;
         if (usb_host_lib_info(&info) == ESP_OK) {
