@@ -7,8 +7,11 @@
 #include "esp_log.h"
 #include "tinyusb.h"
 #include "usb_hid.h"
+#include "kvm_input.h"
 
 static const char *TAG = "usb_hid";
+
+_Static_assert(CFG_TUD_HID == 2, "kbd+mouse 双实例是描述符与回调的硬约定（改 Kconfig 会静默断鼠标）");
 
 // 标准 boot 键盘报表
 static const uint8_t desc_report_kbd[] = { TUD_HID_REPORT_DESC_KEYBOARD() };
@@ -62,13 +65,23 @@ const uint8_t *tud_hid_descriptor_report_cb(uint8_t instance)
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type,
                                uint8_t *buffer, uint16_t reqlen)
 {
-    return 0;
+    // HID 规范对 boot 键盘 GET_REPORT 是强制项；部分主机初始化时会探测，
+    // 恒 STALL 可能被拒。返回最后一份报表快照。
+    if (report_type != HID_REPORT_TYPE_INPUT) {
+        return 0;
+    }
+    int n = kvm_input_get_report(instance, buffer, reqlen);
+    return n > 0 ? (uint16_t)n : 0;
 }
 
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type,
                            uint8_t const *buffer, uint16_t bufsize)
 {
+    static uint8_t s_led_last = 0xFF;
     if (instance == 0 && report_type == HID_REPORT_TYPE_OUTPUT && bufsize > 0) {
-        ESP_LOGI(TAG, "kbd LED = 0x%02X", buffer[0]);
+        if (buffer[0] != s_led_last) {      // 只在变化时打：CapsLock 连切不会刷爆串口
+            s_led_last = buffer[0];
+            ESP_LOGI(TAG, "kbd LED = 0x%02X", buffer[0]);
+        }
     }
 }

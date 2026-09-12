@@ -3,7 +3,7 @@
 #pragma once
 #include <stdint.h>
 
-// 二进制事件（未来网络层的上行输入协议，小端）
+// 二进制事件（net_server WS/HTTP 的上行输入协议，小端）
 //   0x01 KBD    [modifiers][keycode[6]]                8B
 //   0x02 MOUSE  [buttons][x u16][y u16][wheel i8]      7B
 void kvm_input_handle(const uint8_t *data, int len);
@@ -14,5 +14,8 @@ int kvm_input_text(const char *s, int len);
 // 全部松开：键盘全松、鼠标按键/滚轮归零（坐标不动——归零会把指针拽到左上角）。
 // 上层断线时必须调用，否则浏览器断网/关标签时那个全零包发不出去，被控机一直卡着键。
 void kvm_input_release_all(void);
+
+// GET_REPORT 用：返回最后一次入队的报表（inst 0=键盘 8B，1=鼠标 6B），不适用返回 0
+int kvm_input_get_report(uint8_t inst, uint8_t *out, size_t cap);
 
 void kvm_input_start(void);

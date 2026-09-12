@@ -118,4 +118,13 @@ static int max_refame_buffer_size(int16_t mb_width)]=])
         file(WRITE "${_h264_file}" "${_h264_src}")
         message(STATUS "esp_h264: applied sskvm ref/db sticky-cache patch")
     endif()
+    # string(REPLACE) 在上游源码变化时会静默 no-op：没打上 = 1080P 掉回 13fps 的坑
+    # 重新挖开，所以 configure 时硬性断言三处补丁全在，缺任何一处直接 FAIL
+    file(READ "${_h264_file}" _h264_verify)
+    string(FIND "${_h264_verify}" "sskvm_cached_take(&sskvm_ref_cache" _h264_p1)
+    string(FIND "${_h264_verify}" "sskvm_cached_take(&sskvm_db_cache" _h264_p2)
+    string(FIND "${_h264_verify}" "块留给下一次 open 复用" _h264_p3)
+    if(_h264_p1 EQUAL -1 OR _h264_p2 EQUAL -1 OR _h264_p3 EQUAL -1)
+        message(FATAL_ERROR "esp_h264 sskvm 补丁没打全（上游源码变了？）—— 先核对 REPLACE 目标串再升级组件")
+    endif()
 endif()

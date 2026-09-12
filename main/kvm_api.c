@@ -6,7 +6,7 @@
 //   POST /config        res=N / hostname=xxx
 //   GET  /snapshot.jpg  采集卡原始 JPEG（agent）
 //   POST /input         二进制键鼠事件（agent）
-//   POST /type          UTF-8 文本（agent，HID 键盘拆键）
+//   POST /type          ASCII 文本（agent，HID 键盘拆键；非 ASCII 设备端跳过）
 //   GET  /ws            WebSocket（排他，占用中回 409）
 #include <string.h>
 #include <stdlib.h>
@@ -38,11 +38,11 @@ extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
 // 编码器直接把 H264 写进这两块缓冲（载荷前预留 64B：帧头 8B + WS 头 ≤10B），
 // publish 只记指针，零拷贝。会话任务把 latest 标 busy 发送、发完解除；
 // 编码任务只写非 busy 的缓冲 → 编码与发送并行，但永不超过一帧在途。
-#define FRAME_MAX (1024 * 1024)         // 单帧 H264 上限（1080P IDR 在 qp_min=18 下可能 >512KB）
 #define STALL_MAX 250                   // 连续 ~500ms 不可写就踢（对端死了）
 #define OUT_N 2
 
 static uint8_t *s_out_payload[OUT_N];   // H264 载荷起点（缓冲基址 + 64B 预留）
+static size_t s_out_cap;                // 单帧上限 = 编码输出缓冲容量（out_register 传入）
 static SemaphoreHandle_t s_out_mu;
 static bool s_out_busy[OUT_N];          // 会话正在发送
 static int s_latest = -1;               // 最新 publish 的缓冲
@@ -63,7 +63,7 @@ void kvm_api_out_register(uint8_t *p0, uint8_t *p1, size_t cap)
 {
     s_out_payload[0] = p0;
     s_out_payload[1] = p1;
-    (void)cap;
+    s_out_cap = cap;
     s_out_mu = xSemaphoreCreateMutex();
 }
 
@@ -90,7 +90,20 @@ uint8_t *kvm_api_out_try_acquire(void)
 // 视频帧载荷前 8B：[u32 pts_ms][u16 w][u16 h]，WS 头由 net_server 补在最前面
 void kvm_api_publish_frame(const uint8_t *data, size_t len, uint32_t pts_ms, bool key, void *ctx)
 {
-    if (!s_out_mu || len == 0 || len > FRAME_MAX) {
+    if (!s_out_mu || len == 0) {
+        return;
+    }
+    if (len > s_out_cap) {
+        // 超过缓冲容量的帧发不出去。已编出的帧必须全部发出（H264 参考链），
+        // 静默丢 P 帧会让后续帧全烂到下一个 GOP —— 立刻催 IDR 掐断污染
+        static int64_t s_last_warn;
+        int64_t now = esp_timer_get_time();
+        if (now - s_last_warn > 1000000) {
+            s_last_warn = now;
+            video_pipeline_force_idr();
+            ESP_LOGW(TAG, "frame %uKB > out cap %uKB, drop + force IDR",
+                     (unsigned)(len / 1024), (unsigned)(s_out_cap / 1024));
+        }
         return;
     }
     int i = -1;
@@ -179,10 +192,14 @@ static void ws_input(const uint8_t *data, size_t len, void *ctx)
         video_pipeline_force_idr();
         break;
     case 0x05: {                        // 应用层心跳：带设备时钟，前端算真实单向延时
-        char pong[48];
-        snprintf(pong, sizeof(pong), "{\"t\":\"pong\",\"d\":%u}",
-                 (unsigned)(esp_timer_get_time() / 1000));
-        net_ws_send_text(pong);
+        // 客户端停止读 TCP 但还在发 ping 时，pong 会阻塞到 100ms 超时，
+        // 把 tick 的踢人节奏（~0.5s）拖成几十秒 —— 不可写就先不发，下轮再算
+        if (net_ws_writable()) {
+            char pong[48];
+            snprintf(pong, sizeof(pong), "{\"t\":\"pong\",\"d\":%u}",
+                     (unsigned)(esp_timer_get_time() / 1000));
+            net_ws_send_text(pong);
+        }
         break;
     }
     case 0x06:                          // 切分辨率（binary 一条搞定，设备端不解析 JSON）
@@ -199,7 +216,9 @@ static void ws_input(const uint8_t *data, size_t len, void *ctx)
 static void ws_tick(void *ctx)
 {
     uint32_t k = state_key();
-    if (k != s_sent_key) {
+    if (k != s_sent_key && net_ws_writable()) {
+        // 状态变更也不在不可写时硬发：发送卡 100ms 会拖慢踢人节奏；
+        // s_sent_key 没更新，可写后下一轮自然补发
         char json[160];
         state_json(json, sizeof(json));
         if (net_ws_send_text(json) == ESP_OK) {
@@ -223,6 +242,9 @@ static void ws_tick(void *ctx)
     uint32_t seq = 0;
     int64_t pub_us = 0;
     int idx = -1;
+    if (!s_out_mu) {
+        return;
+    }
     xSemaphoreTake(s_out_mu, portMAX_DELAY);
     if (s_latest >= 0 && !s_out_busy[s_latest] && s_latest_seq != s_sent_seq &&
         (!s_need_key || s_latest_key)) {
@@ -285,15 +307,20 @@ static const net_ws_ops_t s_ws_ops = {
 };
 
 // ---------------- 鉴权 ----------------
+// token ≤64 字符（kvm_config 的存储上限）：定长比较，长度差不提前返回，
+// 不给时序侧信道留"长度先不同"的口子
 static bool ct_eq(const char *a, const char *b)
 {
-    size_t la = strlen(a), lb = strlen(b);
-    if (la != lb) {
-        return false;
+    unsigned char da[64] = { 0 }, db[64] = { 0 };
+    for (size_t i = 0; i < sizeof(da) && a[i]; i++) {
+        da[i] = (unsigned char)a[i];
+    }
+    for (size_t i = 0; i < sizeof(db) && b[i]; i++) {
+        db[i] = (unsigned char)b[i];
     }
     unsigned char d = 0;
-    for (size_t i = 0; i < la; i++) {
-        d |= (unsigned char)(a[i] ^ b[i]);
+    for (size_t i = 0; i < sizeof(da); i++) {
+        d |= da[i] ^ db[i];
     }
     return d == 0;
 }
@@ -366,8 +393,14 @@ static esp_err_t config_post(const net_req_t *req, net_resp_t *resp, void *ctx)
         return deny(resp);
     }
     if (strncmp(req->body, "res=", 4) == 0) {
-        int idx = atoi(req->body + 4);
-        if (set_res_persist(idx) != ESP_OK) {
+        char *end = NULL;
+        long v = strtol(req->body + 4, &end, 10);
+        // 非数字不再被 atoi 静默解析成 0（切到 480P）：严格解析
+        if (end == req->body + 4 || (*end && *end != ' ' && *end != '\r' && *end != '\n')) {
+            resp->status = 400;
+            return ok_text(resp, "bad res");
+        }
+        if (set_res_persist((int)v) != ESP_OK) {
             resp->status = 400;
             return ok_text(resp, "bad res");
         }
@@ -394,6 +427,10 @@ static esp_err_t config_post(const net_req_t *req, net_resp_t *resp, void *ctx)
     return ok_text(resp, "res= / hostname= / uvc=restart");
 }
 
+#define SNAP_COPY_MAX (2 * 1024 * 1024) // 影子缓冲上限（video_pipeline 的 SHADOW_BUF_SIZE）
+static uint8_t *s_snap_copy[2];         // 常驻拷贝缓冲轮换（影子最大 2MB）：不再每次请求
+                                        // malloc/free 1.5MB 级 PSRAM（碎片化风险）
+static int s_snap_i;
 static esp_err_t snapshot_get(const net_req_t *req, net_resp_t *resp, void *ctx)
 {
     if (!auth_ok(req)) {
@@ -401,24 +438,18 @@ static esp_err_t snapshot_get(const net_req_t *req, net_resp_t *resp, void *ctx)
     }
     const uint8_t *buf = NULL;
     size_t len = 0;
-    if (!video_pipeline_snapshot_begin(&buf, &len)) {
+    int i = s_snap_i++ % 2;             // 双缓冲轮换：两个并发 agent 各占一块
+    if (!s_snap_copy[i] || !video_pipeline_snapshot_begin(&buf, &len) || len > SNAP_COPY_MAX) {
         resp->status = 404;
         return ok_text(resp, "no frame yet");
     }
     // 锁内拷走、锁外发送：慢客户端不能堵住解码任务
-    uint8_t *copy = heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
-    if (copy) {
-        memcpy(copy, buf, len);
-    }
+    memcpy(s_snap_copy[i], buf, len);
     video_pipeline_snapshot_end();
-    if (!copy) {
-        return ESP_ERR_NO_MEM;
-    }
     resp->ctype = "image/jpeg";
     resp->no_store = true;
-    resp->data = copy;
+    resp->data = s_snap_copy[i];
     resp->len = len;
-    resp->owned = true;
     return ESP_OK;
 }
 
@@ -457,6 +488,11 @@ static esp_err_t ws_get(const net_req_t *req, net_resp_t *resp, void *ctx)
 esp_err_t kvm_api_start(void)
 {
     net_server_set_ws(&s_ws_ops, NULL);
+    // 截图常驻拷贝缓冲（PSRAM 一次分配，与 YUV/输出缓冲同哲学：不做高频大块分配）
+    for (int i = 0; i < 2; i++) {
+        s_snap_copy[i] = heap_caps_malloc(SNAP_COPY_MAX, MALLOC_CAP_SPIRAM);
+        ESP_RETURN_ON_FALSE(s_snap_copy[i], ESP_ERR_NO_MEM, TAG, "snap copy");
+    }
     ESP_RETURN_ON_ERROR(net_server_add_route("GET", "/", index_get, NULL), TAG, "route /");
     ESP_RETURN_ON_ERROR(net_server_add_route("GET", "/config", config_get, NULL), TAG, "route config");
     ESP_RETURN_ON_ERROR(net_server_add_route("POST", "/config", config_post, NULL), TAG, "route config");

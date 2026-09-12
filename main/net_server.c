@@ -35,6 +35,7 @@ static const char *TAG = "net";
 #define REQ_PER_CONN     8          // keep-alive 每条连接最多几个请求
 #define FIRST_REQ_MS     8000
 #define KEEPALIVE_MS     15000
+#define REQ_TOTAL_MS     20000     // 整个请求（头+body）读完的硬上限，防慢速连接占满会话槽
 #define HANDSHAKE_MS     6000
 #define WS_READ_MS       2          // 会话循环节拍：键鼠入站延时上限
 #define WS_FRAME_MS      200        // 已收到首字节后，整帧读完的超时
@@ -115,8 +116,9 @@ static int tls_read_full(sess_t *s, uint8_t *buf, size_t n, int ms)
     return (int)n;
 }
 
-// 一次写完整块。半写（WANT_WRITE）意味着 mbedtls 的记录状态机停在中间，重试会写坏流，
-// 所以这里只报告失败，调用方直接关会话。
+// 一次写完整块。mbedtls_ssl_write 返回 WANT_WRITE 时官方支持"同参数重试"（记录
+// 状态机停在 mbedtls 内部），但这里取保守策略：100ms 都写不完说明对端读不动了
+// （LAN 下=死了），重试只会越积越多 —— 直接报失败，调用方关会话（有意取舍）。
 static esp_err_t tls_write_all(sess_t *s, const void *data, size_t len)
 {
     if (len == 0) {
@@ -152,7 +154,7 @@ static const char *status_text(int st)
     case 401: return "Unauthorized";
     case 404: return "Not Found";
     case 409: return "Conflict";
-    case 413: return "Payload Too Large";
+    case 403: return "Forbidden";
     case 500: return "Internal Server Error";
     default:  return "Error";
     }
@@ -305,8 +307,9 @@ static int ws_read_frame(sess_t *s, uint8_t *payload, size_t cap, size_t *out_le
             len = (len << 8) | e[i];
         }
     }
-    // 浏览器发来的帧必须 masked；上行只有 ≤13B 的输入帧，控制帧 ≤125B
-    if (!masked || !fin || len > cap) {
+    // 浏览器发来的帧必须 masked；RSV 位必须为 0（我们没有扩展）；上行只有
+    // ≤13B 的输入帧，控制帧 ≤125B
+    if (!masked || !fin || (b[0] & 0x70) || len > cap) {
         ESP_LOGW(TAG, "bad ws frame op=%u fin=%d masked=%d len=%u", op, fin, masked, (unsigned)len);
         return -1;
     }
@@ -370,7 +373,8 @@ static void ws_loop(sess_t *s)
                 break;
             case 0xA:                                   // pong
                 break;
-            case 0x8:                                   // close
+            case 0x8:                                   // close：按 RFC 回一个 close 帧再收尾
+                ws_send_control(0x8, payload, len > 125 ? 125 : len);
                 s->close_req = true;
                 break;
             default:
@@ -397,6 +401,8 @@ typedef struct {
     char path[128];
     char query[128];
     char auth_hdr[64];
+    char host[40];          // Host 头（Origin 校验用）
+    char origin[64];        // Origin 头（浏览器一定带；原生客户端没有）
     bool keep_alive;
     bool ws_upgrade;
     char ws_key[32];
@@ -436,22 +442,40 @@ static bool hdr_get(const char *lines, const char *name, char *out, size_t cap)
 }
 
 // 返回 1 = 有请求，0 = 对端关闭/超时，-1 = 解析失败（回 400 后关）
-static int http_read_request(sess_t *s, hreq_t *h, net_req_t *req)
+// first_req：keep-alive 的后续请求等首字节可以放宽（agent 轮询间隔可能比 8s 长）
+static int http_read_request(sess_t *s, hreq_t *h, net_req_t *req, bool first_req)
 {
     uint8_t *hdr = s->scratch;
     uint8_t *body = s->scratch + HDR_MAX;
     size_t total = 0, scanned = 0;
     int hdr_end = -1;
+    int64_t deadline = 0;               // 首字节到达后启动：整个请求的硬上限（防 slowloris 占槽）
 
     while (total < HDR_MAX - 1) {
         // 头是流式的，不能"读满"：一次读到多少算多少（见 tls_read_some）
-        int r = tls_read_some(s, hdr + total, HDR_MAX - 1 - total,
-                              total == 0 ? FIRST_REQ_MS : KEEPALIVE_MS);
+        int ms;
+        if (total == 0) {
+            ms = first_req ? FIRST_REQ_MS : KEEPALIVE_MS;
+        } else if (deadline) {
+            ms = (int)((deadline - esp_timer_get_time()) / 1000);
+            if (ms <= 0) {
+                return -1;              // 整请求超时：慢慢挤牙膏的连接直接断
+            }
+            if (ms > KEEPALIVE_MS) {
+                ms = KEEPALIVE_MS;
+            }
+        } else {
+            ms = KEEPALIVE_MS;
+        }
+        int r = tls_read_some(s, hdr + total, HDR_MAX - 1 - total, ms);
         if (r == 0) {
             return 0;
         }
         if (r < 0) {
             return total == 0 ? 0 : -1;
+        }
+        if (deadline == 0) {
+            deadline = esp_timer_get_time() + (int64_t)REQ_TOTAL_MS * 1000;
         }
         size_t start = scanned > 3 ? scanned - 3 : 0;
         total += (size_t)r;
@@ -524,6 +548,8 @@ static int http_read_request(sess_t *s, hreq_t *h, net_req_t *req)
     }
     hdr_get(lines, "Sec-WebSocket-Key", h->ws_key, sizeof(h->ws_key));
     hdr_get(lines, "X-Auth-Token", h->auth_hdr, sizeof(h->auth_hdr));
+    hdr_get(lines, "Host", h->host, sizeof(h->host));
+    hdr_get(lines, "Origin", h->origin, sizeof(h->origin));
     h->content_len = 0;
     if (hdr_get(lines, "Content-Length", v, sizeof(v))) {
         h->content_len = atoi(v);
@@ -532,10 +558,18 @@ static int http_read_request(sess_t *s, hreq_t *h, net_req_t *req)
         }
     }
 
-    // body 剩余部分（头部读多了的已经搬过了）
-    if (h->content_len > (int)have &&
-        tls_read_full(s, body + have, (size_t)h->content_len - have, KEEPALIVE_MS) <= 0) {
-        return -1;
+    // body 剩余部分（头部读多了的已经搬过了）。同样受整请求 deadline 约束
+    if (h->content_len > (int)have) {
+        int ms = (int)((deadline - esp_timer_get_time()) / 1000);
+        if (ms <= 0) {
+            return -1;
+        }
+        if (ms > KEEPALIVE_MS) {
+            ms = KEEPALIVE_MS;
+        }
+        if (tls_read_full(s, body + have, (size_t)h->content_len - have, ms) <= 0) {
+            return -1;
+        }
     }
     body[h->content_len] = 0;
 
@@ -547,33 +581,62 @@ static int http_read_request(sess_t *s, hreq_t *h, net_req_t *req)
     req->body_len = (size_t)h->content_len;
     req->aux = s->aux;
     req->aux_len = sizeof(s->aux);
-    req->fd = s->fd;
     return 1;
 }
 
 // ---------------- 响应 ----------------
 static esp_err_t send_response(sess_t *s, const net_resp_t *r, bool keep_alive)
 {
-    char hdr[384];
+    char buf[384 + 384];
     int st = r->status ? r->status : 200;
-    int n = snprintf(hdr, sizeof(hdr),
+    int n = snprintf(buf, sizeof(buf),
                      "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %u\r\n"
                      "%sConnection: %s\r\n\r\n",
                      st, status_text(st), r->ctype ? r->ctype : "text/plain",
                      (unsigned)r->len, r->no_store ? "Cache-Control: no-store\r\n" : "",
                      keep_alive ? "keep-alive" : "close");
-    esp_err_t e = tls_write_all(s, hdr, (size_t)n);
+    // 小响应（状态 JSON/401/409…）头+body 合并成一次 TLS 写：两个记录在
+    // Nagle+延迟 ACK 下第二段要多等一个 ACK（视频路径单写的同款教训）
+    if (r->len && r->len <= sizeof(buf) - (size_t)n) {
+        memcpy(buf + n, r->data, r->len);
+        return tls_write_all(s, buf, (size_t)n + r->len);
+    }
+    esp_err_t e = tls_write_all(s, buf, (size_t)n);
     if (e == ESP_OK && r->len) {
         e = tls_write_all(s, r->data, r->len);
     }
     return e;
 }
 
+// 跨源驱动防护：浏览器一定带 Origin，原生客户端（kvm.py 等）没有。
+// 有 Origin 时，其 host 部分必须与 Host 头一致（= 就是这台设备自己），
+// 否则别的网页可以借操作者浏览器开 WS 拿键鼠 / simple-request 改配置。
+// token 为空时这是唯一防线，所以写操作（POST/WS）一律过这道。
+static bool origin_ok(const hreq_t *h)
+{
+    if (h->origin[0] == 0) {
+        return true;                        // 原生客户端
+    }
+    const char *hp = strstr(h->origin, "://");
+    hp = hp ? hp + 3 : h->origin;
+    char oh[40], hh[40];
+    snprintf(oh, sizeof(oh), "%.*s", (int)strcspn(hp, "/"), hp);
+    snprintf(hh, sizeof(hh), "%.*s", (int)strcspn(h->host, ": \r\n"), h->host);
+    // 端口不参与比较（浏览器对默认端口省略）：比裸主机名即可
+    char oh2[40], hh2[40];
+    snprintf(oh2, sizeof(oh2), "%.*s", (int)strcspn(oh, ":"), oh);
+    snprintf(hh2, sizeof(hh2), "%.*s", (int)strcspn(hh, ":"), hh);
+    return hh2[0] != 0 && strcasecmp(oh2, hh2) == 0;
+}
+
 static bool ws_accept_key(const char *key, char *out, size_t cap)
 {
-    char buf[64];
+    char buf[96];                           // key ≤31 + GUID 36，别卡在 64 的边界上
     int n = snprintf(buf, sizeof(buf), "%s%s", key,
                      "258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    if (n < 0 || (size_t)n >= sizeof(buf)) {
+        return false;                       // key 被截断过：握手不可能成功，别再往下算
+    }
     uint8_t digest[32];
     size_t dlen = 0;
     psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
@@ -648,7 +711,7 @@ static void session_task(void *arg)
     for (int reqs = 0; reqs < REQ_PER_CONN; reqs++) {
         hreq_t h = { 0 };
         net_req_t req = { 0 };
-        int r = http_read_request(s, &h, &req);
+        int r = http_read_request(s, &h, &req, reqs == 0);
         if (r == 0) {
             break;
         }
@@ -672,6 +735,18 @@ static void session_task(void *arg)
             resp.status = 404;
             resp.data = (const uint8_t *)"not found";
             resp.len = 9;
+        } else if (h.ws_upgrade || !strcmp(h.method, "POST")) {
+            // 写操作/WS 升级过跨源检查（GET 是只读的，跨源也读不走内容）
+            if (!origin_ok(&h)) {
+                ESP_LOGW(TAG, "cross-origin %s %s from origin '%s'", h.method, h.path, h.origin);
+                resp.status = 403;
+                resp.data = (const uint8_t *)"cross origin";
+                resp.len = 12;
+            } else if (cb(&req, &resp, ctx) != ESP_OK) {
+                resp.status = resp.status ? resp.status : 500;
+                resp.data = (const uint8_t *)"error";
+                resp.len = 5;
+            }
         } else if (cb(&req, &resp, ctx) != ESP_OK) {
             resp.status = resp.status ? resp.status : 500;
             resp.data = (const uint8_t *)"error";
@@ -704,9 +779,6 @@ static void session_task(void *arg)
         bool keep = h.keep_alive && reqs + 1 < REQ_PER_CONN;
         if (send_response(s, &resp, keep) != ESP_OK) {
             keep = false;
-        }
-        if (resp.owned) {
-            free((void *)resp.data);
         }
         if (!keep) {
             break;

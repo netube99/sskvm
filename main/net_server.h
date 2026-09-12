@@ -20,7 +20,6 @@ typedef struct {
     const char *auth_hdr;   // X-Auth-Token（没有则 ""）
     const char *body;       // NUL 结尾；没有 body 则 ""
     size_t body_len;
-    int fd;
     char *aux;              // 每个连接一块 512B 小缓冲（handler 拼 JSON 用，免 malloc）
     size_t aux_len;
 } net_req_t;
@@ -31,7 +30,6 @@ typedef struct {
     bool no_store;          // 加 Cache-Control: no-store
     const uint8_t *data;
     size_t len;
-    bool owned;             // net_server 发完 free()（快照用）
     bool upgrade_ws;        // 鉴权通过：升级成 WebSocket（占用中则回 409）
 } net_resp_t;
 

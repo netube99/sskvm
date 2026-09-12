@@ -42,7 +42,6 @@
   #ovBtn, #ovSave { padding: 6px 16px; background: #1c1c1c; border: 1px solid #333; color: #ddd;
                     cursor: pointer; font: 12px/1.6 inherit; }
   #ovBtn:hover, #ovSave:hover { background: #2a2a2a; }
-  #ovBtn[hidden] { display: none; }
 
   dialog { position: relative; padding: 0; border: 1px solid #333; background: #0d0d0d; color: #ddd;
            width: 560px; max-width: 94vw; }
@@ -61,6 +60,7 @@
   button.act { flex: none; padding: 6px 14px; background: #1c1c1c; border: 1px solid #333;
                color: #ddd; cursor: pointer; font: 12px/1.6 inherit; }
   button.act:hover { background: #2a2a2a; }
+  button[disabled] { opacity: .4; cursor: default; }
   .seg { display: inline-flex; }
   .seg button { padding: 6px 18px; background: none; border: 0; color: #999; cursor: pointer;
                 font: 13px/1.6 inherit; }
@@ -105,7 +105,7 @@
     <div class="row">
       <label for="host">主机名</label>
       <div class="inline">
-        <input id="host" pattern="[a-z0-9-]{1,32}" autocomplete="off" spellcheck="false">
+        <input id="host" autocomplete="off" spellcheck="false">
         <button class="act" id="saveHost">修改</button>
       </div>
     </div>
@@ -150,12 +150,6 @@ const ovToken = document.getElementById('ovToken');
 
 const RES_DIM = [[640, 480], [1280, 720], [1920, 1080]];
 
-if (!('VideoDecoder' in window)) {
-  setStatus('需要 HTTPS + WebCodecs', false);
-  showOverlay('unsupported', '这个浏览器不支持 WebCodecs，请用 Chrome/Edge 并通过 https 访问');
-  throw new Error('WebCodecs unavailable');
-}
-
 // ---------------- 连接 ----------------
 const TOKEN = new URLSearchParams(location.search).get('token') ||
               sessionStorage.getItem('sskvm_token') || '';
@@ -166,6 +160,13 @@ let ws = null, attempts = 0, retryTimer = 0, hbTimer = 0;
 let ovKind = '';
 let connGen = 0;                      // 连接代号：旧 socket 的异步回调不许动新连接的 UI
 let pingSent = 0, clockK = null;      // clockK = 设备时钟 - 浏览器时钟（由 pong 估出）
+
+// 放在所有声明之后：showOverlay 会写 ovKind（let 声明前是 TDZ，放前面直接 ReferenceError）
+if (!('VideoDecoder' in window)) {
+  setStatus('需要 HTTPS + WebCodecs', false);
+  showOverlay('unsupported', '这个浏览器不支持 WebCodecs，请用 Chrome/Edge 并通过 https 访问');
+  throw new Error('WebCodecs unavailable');
+}
 
 function setStatus(text, ok) {
   connText.textContent = text;
@@ -189,6 +190,11 @@ function send(u8) {
 function connect() {
   if (document.hidden || ovKind === 'busy' || ovKind === 'auth') return;
   clearTimeout(retryTimer);
+  // 重试定时器与 visibilitychange 同一拍触发时会建两条 socket：
+  // 先掐掉在途的那条，别让两条握手赛跑（输的那条会把自己 409 成"被占用"）
+  if (ws && (ws.readyState === 0 || ws.readyState === 1)) {
+    try { ws.close(); } catch (e) {}
+  }
   resetDecoder();
   const gen = ++connGen;
   const sock = new WebSocket(WS_URL);
@@ -217,15 +223,23 @@ function connect() {
 // WS 握手失败时浏览器只给 1006，分不清 401 / 409 / 网络断。
 // 用 /config 探一下：它是普通 HTTP，状态码看得见。
 async function probe() {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 5000);   // 设备半死时 fetch 能挂 30s+：drop 卡死重连停摆
   try {
-    const r = await fetch('/config', { headers: TOKEN ? { 'X-Auth-Token': TOKEN } : {} });
-    if (r.status === 401) return 'auth';
+    const r = await fetch('/config', { headers: TOKEN ? { 'X-Auth-Token': TOKEN } : {}, cache: 'no-store', signal: ac.signal });
+    if (r.status === 401) {
+      // URL 里的 token 优先级最高：错 token 不剥掉，覆盖层输入的新 token 重载后永远用不上
+      if (location.search) history.replaceState(null, '', location.pathname);
+      return 'auth';
+    }
     if (!r.ok) return 'error';
     const c = await r.json();
     updateInfo(c);
     return c.wsBusy ? 'busy' : 'ok';
   } catch (e) {
     return 'error';
+  } finally {
+    clearTimeout(t);
   }
 }
 
@@ -279,11 +293,16 @@ function requestIdr() {
   send(new Uint8Array([0x04]));
 }
 
-function firstNalType(d) {
+// 关键帧判定扫前 64B 找 IDR/SPS：不假设它是访问单元的第一个 NAL
+//（上游哪天在 IDR 前插 SEI 也不至于把关键帧判成 delta 卡死 resync）
+function hasKeyNal(d) {
   for (let i = 0; i + 3 < d.length && i < 64; i++) {
-    if (d[i] === 0 && d[i + 1] === 0 && d[i + 2] === 1) return d[i + 3] & 0x1f;
+    if (d[i] === 0 && d[i + 1] === 0 && d[i + 2] === 1) {
+      const t = d[i + 3] & 0x1f;
+      if (t === 5 || t === 7) return true;
+    }
   }
-  return -1;
+  return false;
 }
 
 function findSps(d) {
@@ -312,8 +331,11 @@ function drawFrame(frame) {
     cv.height = frame.displayHeight;
     fit();
   }
-  ctx.drawImage(frame, 0, 0);
-  frame.close();
+  try {
+    ctx.drawImage(frame, 0, 0);
+  } finally {
+    frame.close();                  // drawImage 抛异常也不能漏 close（VideoFrame 泄漏）
+  }
   // 分辨率真的变了才算切换完成（以画面为准，不信状态事件）
   if (wantRes >= 0 && frame.displayWidth === RES_DIM[wantRes][0] &&
       frame.displayHeight === RES_DIM[wantRes][1]) {
@@ -352,8 +374,7 @@ function onVideo(buf) {
     resetDecoder();
   }
 
-  const nal = firstNalType(data);
-  const key = nal === 5 || nal === 7;
+  const key = hasKeyNal(data);
   if (resync) {
     if (!key) return;                           // 等关键帧
     resync = false;
@@ -364,7 +385,12 @@ function onVideo(buf) {
     const sps = findSps(data);
     if (!sps) { requestIdr(); return; }
     dec = new VideoDecoder({ output: drawFrame, error: onDecodeError });
-    dec.configure({ codec: codecString(sps), avc: { format: 'annexb' }, optimizeForLatency: true });
+    try {
+      dec.configure({ codec: codecString(sps), avc: { format: 'annexb' }, optimizeForLatency: true });
+    } catch (e) {
+      onDecodeError(e);
+      return;
+    }
   }
   if (dec.decodeQueueSize > 2) {                // 解码排队了：丢到下一个关键帧
     requestIdr();
@@ -378,7 +404,7 @@ function onVideo(buf) {
 }
 
 // ---------------- 状态事件 ----------------
-let wantRes = -1, resT0 = 0, curRes = -1;
+let wantRes = -1, curRes = -1;
 
 function onMessage(ev) {
   if (typeof ev.data === 'string') {
@@ -410,7 +436,7 @@ function onMessage(ev) {
 }
 
 function updateHud() {
-  hud.textContent = `${cv.width}x${cv.height} ${fps}fps ${(bps / 1e6).toFixed(1)}Mbps ${lat}ms`;
+  hud.textContent = `${cv.width}x${cv.height} ${fps}fps ${(bps / 1e6).toFixed(1)}Mbps ${Math.max(0, lat)}ms`;
 }
 
 // 心跳/视频都断了 12s 就当连接死了（关掉触发 onclose → 重连）
@@ -471,8 +497,14 @@ function flagMods(e) {
          (e.altKey ? 0x04 : 0) | (e.metaKey ? 0x08 : 0);
 }
 
+// 打字目标（认证覆盖层的 token 输入框 / 设置弹窗里的输入框）不转发也不 preventDefault：
+// 否则 keydown 的 preventDefault 会吞掉字符插入（设置弹窗修过，覆盖层是同款漏网兄弟）
+function typingSomewhere(e) {
+  return menu.open || e.target === ovToken || e.target instanceof HTMLInputElement;
+}
+
 window.addEventListener('keydown', e => {
-  if (menu.open) return;                      // 设置面板里打字不发到被控机
+  if (typingSomewhere(e)) return;
   e.preventDefault();
   if (e.repeat) return;
   const u = HID[e.code];
@@ -481,7 +513,7 @@ window.addEventListener('keydown', e => {
   sendKbd(flagMods(e));
 });
 window.addEventListener('keyup', e => {
-  if (menu.open) return;
+  if (typingSomewhere(e)) return;
   e.preventDefault();
   const u = HID[e.code];
   if (MODS[e.code] !== undefined) mods &= ~MODS[e.code];
@@ -503,6 +535,7 @@ function videoToAbs(clientX, clientY) {
   const r = cv.getBoundingClientRect();
   const s = Math.min(r.width / cv.width, r.height / cv.height);
   const dw = cv.width * s, dh = cv.height * s;
+  if (!dw || !dh) return [16384, 16384];        // 布局未就绪：给屏幕中点，别发 NaN→(0,0)
   const ox = r.left + (r.width - dw) / 2, oy = r.top + (r.height - dh) / 2;
   const nx = Math.min(1, Math.max(0, (clientX - ox) / dw));
   const ny = Math.min(1, Math.max(0, (clientY - oy) / dh));
@@ -547,7 +580,9 @@ cv.addEventListener('contextmenu', e => e.preventDefault());
 window.addEventListener('wheel', e => {
   if (menu.open) return;
   e.preventDefault();
-  wheelAcc += Math.sign(e.deltaY);
+  // deltaY>0 = 向下滚；HID/evdev 惯例滚轮正值=向上滚（实测：设备 +1 → 内核
+  // REL_WHEEL +1 = 向上），所以取负号。上机逐字节验证过，别再"手感测试"了
+  wheelAcc -= Math.sign(e.deltaY);
   wheelAcc = Math.max(-127, Math.min(127, wheelAcc));
   if (wheelAcc) sendMouse();
 }, { passive: false });
@@ -562,6 +597,10 @@ function setResUI(idx) {
 resBtns.forEach(b => b.onclick = () => {
   const idx = Number(b.dataset.res);
   if (idx === curRes) return;
+  if (!(ws && ws.readyState === 1)) {
+    setResUI(curRes);               // WS 断着：别乐观置位干等 20s，直接还原
+    return;
+  }
   setResUI(idx);
   wantRes = idx;
   setTimeout(() => { if (wantRes === idx) { wantRes = -1; } }, 20000);
@@ -581,6 +620,7 @@ document.getElementById('saveHost').onclick = async () => {
   const r = await fetch('/config', {
     method: 'POST',
     headers: TOKEN ? { 'X-Auth-Token': TOKEN } : {},
+    cache: 'no-store',
     body: 'hostname=' + encodeURIComponent(name),
   });
   hint.textContent = r.ok ? '已保存' : ('失败：' + await r.text());
@@ -594,6 +634,7 @@ document.getElementById('restartUvc').onclick = async () => {
     const r = await fetch('/config', {
       method: 'POST',
       headers: TOKEN ? { 'X-Auth-Token': TOKEN } : {},
+      cache: 'no-store',
       body: 'uvc=restart',
     });
     uvcHint.textContent = r.ok ? '已重启，画面几秒后恢复' : ('失败：' + await r.text());
@@ -613,17 +654,21 @@ document.getElementById('closeMenu').onclick = () => menu.close();
 menu.addEventListener('keydown', e => { if (e.key === 'Enter') e.preventDefault(); });
 
 // ---------------- 截图 ----------------
+let shotSeq = 0;                        // 失败文案的恢复定时器用点击序号守卫
 document.getElementById('shotBtn').onclick = async () => {
   const btn = document.getElementById('shotBtn');
   btn.disabled = true;
+  let myClick = ++shotSeq;
   try {
     let r = null;
-    for (let i = 0; i < 6; i++) {           // 冷态先 404 预热，间隔重试
-      r = await fetch('/snapshot.jpg', { headers: TOKEN ? { 'X-Auth-Token': TOKEN } : {} });
-      if (r.ok) break;
+    for (let i = 0; i < 6; i++) {           // 冷态先 404 预热，间隔重试（网络错也重试）
+      try {
+        r = await fetch('/snapshot.jpg', { headers: TOKEN ? { 'X-Auth-Token': TOKEN } : {} });
+        if (r.ok) break;
+      } catch (e) { r = null; }             // 设备恰在重启时点按钮：按超时继续等
       await new Promise(s => setTimeout(s, 350));
     }
-    if (!r.ok) throw new Error('HTTP ' + r.status);
+    if (!r || !r.ok) throw new Error('HTTP ' + (r ? r.status : 0));
     const url = URL.createObjectURL(await r.blob());
     const d = new Date(), p = n => String(n).padStart(2, '0');
     const a = document.createElement('a');
@@ -636,7 +681,7 @@ document.getElementById('shotBtn').onclick = async () => {
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   } catch (e) {
     btn.textContent = '失败';
-    setTimeout(() => { btn.textContent = '截图'; }, 2000);
+    setTimeout(() => { if (myClick === shotSeq) btn.textContent = '截图'; }, 2000);
   } finally {
     btn.disabled = false;
   }

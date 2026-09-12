@@ -11,7 +11,7 @@
     ./kvm.py <host> shot [out.jpg]
     ./kvm.py <host> click <x> <y> [button]     # button: 1=左 2=右 4=中
     ./kvm.py <host> move <x> <y>
-    ./kvm.py <host> wheel <n>                  # 正=向下
+    ./kvm.py <host> wheel <n>                  # 正=向上滚（HID/evdev 惯例）
     ./kvm.py <host> type <text>
     ./kvm.py <host> key <hid_usage>            # 0x28=Enter, 0x04='a'
 

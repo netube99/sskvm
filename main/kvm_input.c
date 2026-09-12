@@ -1,11 +1,9 @@
-// 上层输入事件 → HID 报表。这是未来网络层往设备里灌键鼠的唯一入口（kvm_input_handle）。
+// 上层输入事件 → HID 报表。所有网络入口（WS 会话任务 / HTTP /input /type）都灌到这里。
 //
 // 不在收包回调里直接 tud_hid_n_report()：主机 1ms 轮询一次，tud_hid_n_ready()
 // 经常是 false，直接发会丢。这里只更新"最新状态"，2ms 任务在 ready 时下发。
 // 绝对鼠标天然适合"只发最新"（相对鼠标要累加，这是选绝对的另一个理由）。
-//
-// ponytail: 文本输入（/type 整串敲键）随网络层一起删了，等新传输层定了再回来；
-//           实现留在 git 历史（kvm_input.c @ 8df34c1 之前）。
+// 文本输入（/type 整串敲键）也走这里，见 TEXT_Q_LEN。
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -29,11 +27,14 @@
 #define KBD_Q_LEN   8
 static uint8_t s_kbd_q[KBD_Q_LEN][8];
 static volatile int s_kbd_head, s_kbd_tail;    // head=写，tail=读
+static uint8_t s_kbd_last[8];                  // 最后一次入队的键盘报表（GET_REPORT 用）
 static uint8_t s_mouse[6];
 static bool s_mouse_dirty;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 
-// 文本队列（单生产者=网络任务，单消费者=hid 任务，索引天然原子）
+// 文本队列。注意：生产者不止一个（WS 会话任务 / HTTP /type 任务），消费者是 hid 任务，
+// release_all 又会清队列 —— head/tail/state 的每一次读写都必须在 s_lock 里，
+// 否则 release_all 与 hid 任务/生产者交错会把队列搞倒挂（幽灵打字 + 键盘锁死）。
 typedef struct {
     uint8_t usage;
     uint8_t mods;       // 0 或 0x02(左 Shift)
@@ -41,7 +42,7 @@ typedef struct {
 static key_t s_text_q[TEXT_Q_LEN];
 static volatile int s_text_head, s_text_tail;
 static int s_text_state;            // 0=空闲 1=按住
-static int64_t s_text_next_us;
+static int64_t s_text_next_us;      // 只被 hid 任务读写，可以放锁外
 
 // ASCII(US 布局) → HID keycode + Shift；0 表示不支持（非 ASCII 跳过）
 static key_t map_char(char c)
@@ -108,12 +109,15 @@ int kvm_input_text(const char *s, int len)
         if (k.usage == 0) {
             continue;                       // 不支持的字符跳过
         }
+        portENTER_CRITICAL(&s_lock);
         int next = (s_text_head + 1) % TEXT_Q_LEN;
         if (next == s_text_tail) {
+            portEXIT_CRITICAL(&s_lock);
             break;                          // 满：返回已吃下的字符数，调用者续传
         }
         s_text_q[s_text_head] = k;
         s_text_head = next;
+        portEXIT_CRITICAL(&s_lock);
     }
     return n;
 }
@@ -156,6 +160,7 @@ void kvm_input_handle(const uint8_t *d, int len)
         if (len >= 8) {
             uint8_t rep[8] = { d[1], 0, d[2], d[3], d[4], d[5], d[6], d[7] };
             kbd_push(rep);
+            memcpy(s_kbd_last, rep, sizeof(s_kbd_last));
         }
         break;
     case 0x02:      // 绝对鼠标：buttons + x/y(0..32767) + wheel
@@ -170,47 +175,94 @@ void kvm_input_handle(const uint8_t *d, int len)
     portEXIT_CRITICAL(&s_lock);
 }
 
+// GET_REPORT（部分 BIOS/主机初始化时探测）：返回最后一次入队的报表快照
+int kvm_input_get_report(uint8_t inst, uint8_t *out, size_t cap)
+{
+    int n = 0;
+    portENTER_CRITICAL(&s_lock);
+    if (inst == 0 && cap >= sizeof(s_kbd_last)) {
+        memcpy(out, s_kbd_last, sizeof(s_kbd_last));
+        n = (int)sizeof(s_kbd_last);
+    } else if (inst == 1 && cap >= sizeof(s_mouse)) {
+        memcpy(out, s_mouse, sizeof(s_mouse));
+        n = (int)sizeof(s_mouse);
+    }
+    portEXIT_CRITICAL(&s_lock);
+    return n;
+}
+
 static void hid_task(void *arg)
 {
-    // ponytail: 鼠标只存最新快照（绝对坐标）；键盘走 8 深队列，见 KBD_Q_LEN。
+    // 鼠标只存最新快照（绝对坐标）；键盘走 8 深队列，见 KBD_Q_LEN。
     while (1) {
         int64_t now = esp_timer_get_time();
-        bool text_busy = (s_text_state != 0) || (s_text_tail != s_text_head);
 
         // ---- 文本状态机优先 ----
+        // 按下/抬起与队列推进全部在锁内变更（生产者/release_all 会并发清队），
+        // tud_* 发送在锁外。按下失败不丢字符（留在队头重试），抬起失败保持
+        // 按住重发抬起 —— 键盘不能发出去就永远按下。
+        bool press = false, release = false;
+        key_t tk = { 0, 0 };
+        portENTER_CRITICAL(&s_lock);
         if (s_text_state == 0) {
-            if (s_text_tail != s_text_head && now >= s_text_next_us && tud_hid_n_ready(0)) {
-                key_t k = s_text_q[s_text_tail];
-                uint8_t kc[6] = { k.usage, 0, 0, 0, 0, 0 };
-                tud_hid_n_keyboard_report(0, 0, k.mods, kc);
+            if (s_text_tail != s_text_head && now >= s_text_next_us) {
+                tk = s_text_q[s_text_tail];     // 只拷贝不出队：抬起成功才算敲完
+                press = true;
                 s_text_state = 1;
                 s_text_next_us = now + TEXT_HOLD_US;
             }
-        } else if (now >= s_text_next_us && tud_hid_n_ready(0)) {
-            tud_hid_n_keyboard_report(0, 0, 0, NULL);
-            s_text_tail = (s_text_tail + 1) % TEXT_Q_LEN;
+        } else if (now >= s_text_next_us) {
+            release = true;
             s_text_state = 0;
             s_text_next_us = now + TEXT_GAP_US;
         }
+        portEXIT_CRITICAL(&s_lock);
+        if (press) {
+            uint8_t kc[6] = { tk.usage, 0, 0, 0, 0, 0 };
+            bool sent = tud_hid_n_ready(0) && tud_hid_n_keyboard_report(0, 0, tk.mods, kc);
+            if (!sent) {
+                portENTER_CRITICAL(&s_lock);
+                s_text_state = 0;
+                s_text_next_us = now + 2000;    // 端点忙：稍后重试同一字符
+                portEXIT_CRITICAL(&s_lock);
+            }
+        } else if (release) {
+            bool sent = tud_hid_n_ready(0) && tud_hid_n_keyboard_report(0, 0, 0, NULL);
+            if (sent) {
+                portENTER_CRITICAL(&s_lock);
+                if (s_text_tail != s_text_head) {   // release_all 清过就不再推进
+                    s_text_tail = (s_text_tail + 1) % TEXT_Q_LEN;
+                }
+                portEXIT_CRITICAL(&s_lock);
+            } else {
+                portENTER_CRITICAL(&s_lock);
+                s_text_state = 1;               // 松开没发出去：保持按住，下一轮重发抬起
+                s_text_next_us = now + 2000;
+                portEXIT_CRITICAL(&s_lock);
+            }
+        }
 
         // ---- 物理键鼠（文本忙时让路，避免两边抢键盘）----
+        // 键盘"取件即出队"（拷贝+推进同一临界区）：release_all 之后压入的全零
+        // 释放报文只会排在本条之后，永远不会被跳过 —— 旧行为（先发后推进）
+        // 和 release_all 竞态时会把全零包跳过，断线后按键永久卡死。
         portENTER_CRITICAL(&s_lock);
+        bool text_busy = (s_text_state != 0) || (s_text_tail != s_text_head);
         bool kd = s_kbd_head != s_kbd_tail && !text_busy;
         bool md = s_mouse_dirty;
         uint8_t kbd[8], mouse[6];
         if (kd) {
             memcpy(kbd, s_kbd_q[s_kbd_tail], sizeof(kbd));
+            s_kbd_tail = (s_kbd_tail + 1) % KBD_Q_LEN;
         }
         memcpy(mouse, s_mouse, sizeof(mouse));
         portEXIT_CRITICAL(&s_lock);
 
-        if (kd && tud_hid_n_ready(0)) {
-            tud_hid_n_keyboard_report(0, 0, kbd[0], &kbd[2]);
-            portENTER_CRITICAL(&s_lock);
-            if (s_kbd_tail != s_kbd_head) {
-                s_kbd_tail = (s_kbd_tail + 1) % KBD_Q_LEN;
+        if (kd) {
+            if (tud_hid_n_ready(0)) {
+                // 发送失败就丢这一条：报表是全量快照，后续报文会覆盖最终状态
+                tud_hid_n_keyboard_report(0, 0, kbd[0], &kbd[2]);
             }
-            portEXIT_CRITICAL(&s_lock);
         }
         if (md) {
             // 端点忙时不能当发过了：丢掉的是"松开"那一条，被控机就永远按着鼠标键。
@@ -229,7 +281,9 @@ static void hid_task(void *arg)
 
 void kvm_input_start(void)
 {
-    if (xTaskCreate(hid_task, "hid", 3072, NULL, 5, NULL) != pdPASS) {
+    // prio 11 / core0：低于 USB 任务（15/16）与 TinyUSB（12），高于编码（10）；
+    // 运行时间极短（µs 级），不挤占视频管线，但不会被满载拖出 ~1ms 的输入延时
+    if (xTaskCreatePinnedToCore(hid_task, "hid", 3072, NULL, 11, NULL, 0) != pdPASS) {
         ESP_LOGE("kvm_input", "hid task create failed");
     }
 }

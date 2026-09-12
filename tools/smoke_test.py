@@ -12,7 +12,6 @@
   6. wss /ws 能收到帧且是 Annex-B（8B 帧头之后是起始码 00 00 01）
 """
 import base64
-import hashlib
 import json
 import os
 import socket

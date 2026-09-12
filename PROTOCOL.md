@@ -1,6 +1,8 @@
 # sskvm 接口协议
 
 一个端口（443，HTTPS/WSS）。鉴权用 token（`?token=` 或 `X-Auth-Token`，空 = 不鉴权）。
+带浏览器 `Origin` 头的请求（跨源网页借浏览器操作）一律 `403`：原生客户端（kvm.py 等）
+没有 Origin 头，不受影响。
 
 ## HTTP
 
@@ -9,9 +11,9 @@
 | GET | `/` | 否 | 单文件前端页面（不鉴权，token 错了页面才有机会提示输入） |
 | GET | `/config` | 是 | 设备状态 JSON |
 | POST | `/config` | 是 | `res=0/1/2`、`hostname=<名字>` 或 `uvc=restart`（重启采集卡流） |
-| GET | `/snapshot.jpg` | 是 | 采集卡原始 JPEG（最新一帧，给 agent） |
+| GET | `/snapshot.jpg` | 是 | 采集卡原始 JPEG（影子缓冲最近一帧，给 agent；见下） |
 | POST | `/input` | 是 | body = 二进制键鼠事件（见下） |
-| POST | `/type` | 是 | body = UTF-8 文本，P4 拆成 HID 按键；队列满返回已收字符数 |
+| POST | `/type` | 是 | body = ASCII 文本（美式布局，非 ASCII 字符跳过），P4 拆成 HID 按键；队列满返回已收字符数 |
 | GET | `/ws` | 是 | WebSocket 升级（排他：已有一个浏览器时返回 `409 {"error":"busy"}`） |
 
 `/config` 响应：
@@ -27,6 +29,11 @@ HTTP 响应支持 keep-alive（agent 连续拉图复用一条 TLS 连接），�
 
 `POST /config` 的 `uvc=restart`：关掉采集流并按**当前分辨率**重新协商、重开（~1s，WS 不断），
 用于采集卡拔插/抽风后画面异常的软件复位；成功回 `restarting`（异步）。
+
+`/snapshot.jpg` 的语义是**影子缓冲**（agent 高频拉图才热）：
+- 影子超过 300ms 没刷新 → 返回 `404 "no frame yet"` 并预热，**客户端等 ~350ms 重试**即可命中
+  （tools/kvm.py、前端截图按钮、smoke_test 都按此契约实现）
+- 热状态下约 ~10/s 的影子更新节奏，单张是完整的采集卡原始 JPEG
 
 ## WebSocket `/ws`
 

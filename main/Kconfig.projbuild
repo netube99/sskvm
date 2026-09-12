@@ -26,7 +26,7 @@ menu "SSKVM"
         default 8000000
         help
             码控目标码率（也是上限，静止画面实测远低于此）。
-            720P 35fps 下 8Mbps ≈ 28KB/帧；局域网可以再往上加。
+            720P 46fps 下 8Mbps ≈ 22KB/帧；局域网可以再往上加。
 
     config SSKVM_SNTP_SERVER
         string "SNTP server"
@@ -38,8 +38,7 @@ menu "SSKVM"
         string "Access token (empty = no auth)"
         default ""
         help
-            If non-empty, every HTTP/WS request must carry ?token=<value>
-            or the X-Auth-Token header. Set this before exposing the device
+            If non-empty, every HTTP/WS request must carry ?token=<value>            or the X-Auth-Token header. Set this before exposing the device
             to an untrusted network.
 
 endmenu

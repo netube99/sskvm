@@ -1,4 +1,4 @@
-// 复合 USB 设备：HID 键盘 + HID 绝对鼠标 + MSC，跑在 OTG_FS 的 FS_PHY1（GPIO24/25）
+// 复合 USB 设备：HID 键盘 + HID 绝对鼠标，跑在 OTG_FS 的 FS_PHY1（GPIO24/25）
 #pragma once
 #include <stdbool.h>
 #include "esp_err.h"

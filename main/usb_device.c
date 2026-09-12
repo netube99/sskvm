@@ -15,6 +15,7 @@
 #include "tinyusb_default_config.h"
 #include "usb_device.h"
 #include "usb_hid.h"
+#include "kvm_input.h"
 
 static const char *TAG = "usb_dev";
 
@@ -32,7 +33,8 @@ enum {
 #define CFG_DESC_LEN          (TUD_CONFIG_DESC_LEN + 2 * TUD_HID_DESC_LEN)
 
 static const uint8_t desc_cfg[] = {
-    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CFG_DESC_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    // 不声明 REMOTE_WAKEUP：没有实现（从未调 tud_remote_wakeup），别对主机做虚假承诺
+    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CFG_DESC_LEN, 0, 100),
     // 接口号, 字符串索引(0=无), boot 协议, 报表描述符长度, EP IN, EP 大小, 轮询间隔
     TUD_HID_DESCRIPTOR(ITF_NUM_HID_KBD, 0, HID_ITF_PROTOCOL_KEYBOARD, USB_HID_REPORT_KBD_LEN,
                        0x80 | EPNUM_HID_KBD, CFG_TUD_HID_EP_BUFSIZE, HID_POLL_MS),
@@ -44,8 +46,19 @@ static volatile bool s_mounted;     // 主机已完成枚举（/config 的 usb �
 
 static void usb_event_cb(tinyusb_event_t *event, void *arg)
 {
-    s_mounted = (event->id == TINYUSB_EVENT_ATTACHED);
-    ESP_LOGI(TAG, "host %s", s_mounted ? "enumerated" : "disconnected");
+    bool mounted;
+    if (event->id == TINYUSB_EVENT_ATTACHED) {
+        mounted = true;
+    } else if (event->id == TINYUSB_EVENT_DETACHED) {
+        mounted = false;
+        // 主机侧重启/重枚举：不松的话 hid 任务会把断开期间积压的键鼠状态
+        // （按住的键/鼠标键）灌给重枚举后的全新主机会话
+        kvm_input_release_all();
+    } else {
+        return;                             // 未来若开 suspend 回调，别误清 mounted
+    }
+    s_mounted = mounted;
+    ESP_LOGI(TAG, "host %s", mounted ? "enumerated" : "disconnected");
 }
 
 bool usb_device_mounted(void) { return s_mounted; }

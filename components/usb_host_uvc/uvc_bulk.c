@@ -230,8 +230,13 @@ skip_sof:
         // memcpy. The urb->frame copy below happens anyway, so stripping here is
         // free. On signature mismatch the payload is appended as-is
         // (that frame fails to decode and is dropped — same failure mode as before).
-        const uint8_t hdr_len = payload_data[0];  // DMA 缓冲的每个字段只读一次（与 stock 代码同样的约定；
-        const uint8_t hdr_id = payload_data[1];   // 重复读会撞上完成 IRQ 与最后字节落地的竞态）
+        // DMA 缓冲的每个字段只读一次（与 stock 代码同样的约定；重复读会撞上完成
+        // IRQ 与最后字节落地的竞态）—— 先验长度，再读字节
+        uint8_t hdr_len = 0, hdr_id = 0;
+        if (payload_data_len >= 2) {
+            hdr_len = payload_data[0];
+            hdr_id = payload_data[1];
+        }
         if (!uvc_stream->single_thread.same_urb_cont &&
                 payload_data_len >= 12 && hdr_len == 0x0C &&
                 (hdr_id & 0xFE) == 0x8C &&

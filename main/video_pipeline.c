@@ -11,6 +11,7 @@
 // 采集在 uvc_capture，这里只做编解码与流水调度。
 // 分辨率是运行时变量（480P/720P/1080P），切换时重建编码器、重开 UVC 流。
 #include <inttypes.h>
+#include <stdatomic.h>
 #include <string.h>
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -101,7 +102,8 @@ static video_frame_cb_t s_frame_cb;
 static void *s_frame_cb_ctx;
 static volatile bool s_force_idr;
 static volatile bool s_enc_quit, s_enc_stopped;
-static volatile int s_pending_res = -1;
+static atomic_int s_pending_res = -1;       // 跨核读改写必须原子：strip 用交换取出，
+                                            // 普通读后清零会丢更新（连点分辨率时踩过理论窗口）
 static volatile bool s_res_busy;
 static volatile uint32_t s_enc_frames;      // 编码成功计数
 static volatile uint32_t s_idr_frames;      // IDR 帧计数
@@ -111,11 +113,10 @@ static int64_t s_enc_us, s_dec_us, s_wait_us, s_lat_us, s_lat_max;
 static int64_t s_enc_i_us;                  // IDR 帧的编码时间（诊断：和 P 帧分开看）
 static uint32_t s_enc_i_n, s_enc_p_n;
 static int64_t s_bufwait_us, s_strip_us;
-static uint32_t s_jpeg_bytes, s_enc_bytes;
+static uint32_t s_in_bytes, s_enc_bytes;    // UVC 输入帧 / H264 输出帧的平均大小
 static uint32_t s_dec_fail;                 // 连续解码失败计数（日志限速用）
 
 int video_pipeline_res(void) { return s_res; }
-int video_pipeline_res_count(void) { return RES_N; }
 const char *video_pipeline_res_name(int idx)
 {
     return (idx >= 0 && idx < (int)RES_N) ? RES[idx].name : "?";
@@ -166,7 +167,7 @@ void video_pipeline_snapshot_end(void)
 void video_pipeline_request_rebuild(void)
 {
     s_res_busy = true;
-    s_pending_res = s_res;      // 让 decode 任务按当前分辨率整套重建
+    atomic_store(&s_pending_res, s_res);    // 让 strip 任务按当前分辨率整套重建
 }
 
 void video_pipeline_force_idr(void)
@@ -181,20 +182,20 @@ static void stats_log(void)
     if (++n % STATS_N) {
         return;
     }
-    ESP_LOGI(TAG, "%s lat=%.1f/%.1fms (wait=%.1f buf=%.1f strip=%.1f dec=%.1f enc=%.1f) jpeg=%.0fKB h264=%.1fKB idr=%lu gate=%.1fms",
+    ESP_LOGI(TAG, "%s lat=%.1f/%.1fms (wait=%.1f buf=%.1f strip=%.1f dec=%.1f enc=%.1f) in=%.0fKB h264=%.1fKB idr=%lu gate=%.1fms",
              RES[s_res].name,
              s_lat_us / 1000.0 / STATS_N, s_lat_max / 1000.0,
              s_wait_us / 1000.0 / STATS_N, s_bufwait_us / 1000.0 / STATS_N,
              s_strip_us / 1000.0 / STATS_N, s_dec_us / 1000.0 / STATS_N,
              s_enc_us / 1000.0 / STATS_N,
-             s_jpeg_bytes / 1024.0 / STATS_N, s_enc_bytes / 1024.0 / STATS_N,
+             s_in_bytes / 1024.0 / STATS_N, s_enc_bytes / 1024.0 / STATS_N,
              (unsigned long)s_idr_frames, s_gate_us / 1000.0 / STATS_N);
     // 编码时间按帧型拆开：IDR 是否拖慢均值一眼可见
     ESP_LOGI(TAG, "enc split: P %.1fms x%lu | IDR %.1fms x%lu",
              s_enc_p_n ? (s_enc_us - s_enc_i_us) / 1000.0 / s_enc_p_n : 0, (unsigned long)s_enc_p_n,
              s_enc_i_n ? s_enc_i_us / 1000.0 / s_enc_i_n : 0, (unsigned long)s_enc_i_n);
     s_lat_us = s_wait_us = s_bufwait_us = s_strip_us = s_dec_us = s_enc_us = 0;
-    s_jpeg_bytes = s_enc_bytes = s_lat_max = 0;
+    s_in_bytes = s_enc_bytes = s_lat_max = 0;
     s_gate_us = 0;
     s_enc_i_us = 0;
     s_enc_i_n = s_enc_p_n = 0;
@@ -305,6 +306,9 @@ static void codec_free(void)
     }
     yuv_frame_t yf;
     while (xQueueReceive(s_ready_yuv_q, &yf, 0) == pdPASS) {
+        if (yf.buf) {
+            xQueueSend(s_free_yuv_q, &yf.buf, 0);   // 在途的 YUV 记回账，别弄丢
+        }
     }
     if (s_enc) {
         esp_h264_enc_close(s_enc);
@@ -386,7 +390,7 @@ esp_err_t video_pipeline_set_resolution(int idx)
 {
     ESP_RETURN_ON_FALSE(idx >= 0 && idx < (int)RES_N, ESP_ERR_INVALID_ARG, TAG, "bad res");
     if (idx != s_res) {
-        s_pending_res = idx;    // 由 decode 任务在安全点执行重建
+        atomic_store(&s_pending_res, idx);  // 由 strip 任务在安全点执行重建
         s_res_busy = true;
     }
     return ESP_OK;
@@ -419,6 +423,9 @@ static void pipeline_reconfigure(int idx)
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     s_enc_quit = s_enc_stopped = false;
+#if CONFIG_SSKVM_VIDEO_TEST_PATTERN
+    s_pattern_pause = true;
+#endif
 
     codec_free();
     set_res(idx);
@@ -430,8 +437,13 @@ static void pipeline_reconfigure(int idx)
                  (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
         esp_restart();
     }
+#if CONFIG_SSKVM_VIDEO_TEST_PATTERN
+    s_pattern_pause = false;
+#endif
     if (xTaskCreatePinnedToCore(encode_task, "encode", 4096, NULL, 10, NULL, 0) != pdPASS) {
-        ESP_LOGE(TAG, "encode task create failed");
+        // 编码任务建不出来 = 管线静默死亡（画面永远回不来）：与 codec_alloc 失败同罪
+        ESP_LOGE(TAG, "encode task create failed, rebooting");
+        esp_restart();
     }
     // 诊断：ref/db 缓冲首选内部 RAM，分不到就退 PSRAM（退了对编码速度不利）
     ESP_LOGW(TAG, "codec alloc: iram %lu -> %lu KB (delta %ld KB)",
@@ -452,6 +464,8 @@ static void pipeline_reconfigure(int idx)
 
 // ---------------- 合成测试图案（不接采集卡时验证编码路径） ----------------
 #if CONFIG_SSKVM_VIDEO_TEST_PATTERN
+static volatile bool s_pattern_pause;   // 管线重建时挂起 pattern 任务：它不受 dec_mu 约束，
+                                        // 手里的 YUV 会和 codec_alloc 重推的指针撞车
 static void fill_test_pattern(uint8_t *buf, uint32_t frame_idx)
 {
     const uint32_t row_bytes = s_w * 3 / 2;
@@ -471,6 +485,10 @@ static void test_pattern_task(void *arg)
     uint32_t i = 0;
     TickType_t last = xTaskGetTickCount();
     while (1) {
+        if (s_pattern_pause) {              // 重建期间别碰 YUV 池（账目由 codec_free/alloc 接管）
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
         uint8_t *yuv = NULL;
         if (xQueueReceive(s_free_yuv_q, &yuv, pdMS_TO_TICKS(50)) == pdPASS) {
             fill_test_pattern(yuv, i);
@@ -502,9 +520,10 @@ static void strip_task(void *arg)
                 ESP_LOGW(TAG, "capture restart requested");
                 break;                  // 外层关流→按当前分辨率重开
             }
-            int idx = s_pending_res;        // 分辨率切换：安全点（手里无帧）重建
+            // 原子交换取出（清零即取走）：普通"读后清"跨核会丢更新，
+            // 请求丢掉不说还把 resBusy 永久卡在 1
+            int idx = atomic_exchange(&s_pending_res, -1);
             if (idx >= 0) {
-                s_pending_res = -1;
                 pipeline_reconfigure(idx);
                 if (!uvc_capture_connected()) {
                     break;                  // 流没了，外层重开
@@ -522,6 +541,7 @@ static void strip_task(void *arg)
             }
             last_frame_us = esp_timer_get_time();
             s_bufwait_us += esp_timer_get_time() - f.capture_us;
+            s_in_bytes += f.len;
 
             // 截图影子：仅 agent 在拉图（热）时拷贝。冷时不拷 → 帧数据零拷贝。
             // 热时限速 ~10/s：agent 拉 ~8/s，管线 60fps——不节流就是每帧拷一整张
@@ -591,6 +611,18 @@ static void decode_task(void *arg)
         s_wait_us += t0 - j.f.capture_us;
         s_dec_us += esp_timer_get_time() - t0;
         uvc_capture_release(&j.f);
+        // 解出来的尺寸不对 = 卡给的帧和管线尺寸错配（历史上表现为斜切花屏）：
+        // 按解码失败处理，日志直接指认错配而不是等花屏再猜
+        if (jerr == ESP_OK && out_size != (uint32_t)s_w * s_h * 3 / 2) {
+            s_dec_fail++;
+            if (s_dec_fail == 1 || s_dec_fail % 100 == 0) {
+                ESP_LOGW(TAG, "jpeg size mismatch: got %u B, want %u B (%s)",
+                         (unsigned)out_size, (unsigned)(s_w * s_h * 3 / 2), RES[s_res].name);
+            }
+            xQueueSend(s_free_yuv_q, &yuv, 0);
+            xSemaphoreGive(s_dec_mu);
+            continue;
+        }
         if (jerr != ESP_OK) {
             s_dec_fail++;                      // 限速日志：115200 串口刷爆会反噬 USB 回调时序
             if (s_dec_fail == 1 || s_dec_fail % 100 == 0) {

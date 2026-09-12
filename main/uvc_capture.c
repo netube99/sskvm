@@ -1,5 +1,6 @@
 // UVC 采集实现。详见 uvc_capture.h。
 #include <string.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -25,17 +26,16 @@ static QueueHandle_t s_frame_q;
 static SemaphoreHandle_t s_frame_mu;    // 串行化 frame_cb 与关流时的回收
 static volatile bool s_closing;
 static volatile bool s_connected;
-static volatile bool s_restart;    // 请求关流重开（设置页按钮 / 拔插后自愈）
+static atomic_int s_restart;        // 请求关流重开（设置页按钮 / 拔插后自愈）；跨核读改写必须原子
 static uint8_t s_cap_fps;           // 请求的采集帧率（0 = 卡的默认/最高）
 static uvc_host_stream_hdl_t s_stream;
-static uint8_t s_dev_addr, s_uvc_idx;
+static uint8_t s_dev_addr;
 static volatile uint32_t s_frames;      // 收到的帧计数（监督任务用）
 
 static void driver_event_cb(const uvc_host_driver_event_data_t *event, void *user_ctx)
 {
     if (event->type == UVC_HOST_DRIVER_EVENT_DEVICE_CONNECTED) {
         s_dev_addr = event->device_connected.dev_addr;
-        s_uvc_idx = event->device_connected.uvc_stream_index;
         ESP_LOGI(TAG, "camera connected: addr=%d, %d formats",
                  s_dev_addr, event->device_connected.frame_info_num);
     }
@@ -144,16 +144,12 @@ void uvc_capture_set_format(uint16_t w, uint16_t h, uint8_t fps)
 
 void uvc_capture_request_restart(void)
 {
-    s_restart = true;
+    atomic_store(&s_restart, 1);
 }
 
 bool uvc_capture_take_restart_request(void)
 {
-    if (!s_restart) {
-        return false;
-    }
-    s_restart = false;
-    return true;
+    return atomic_exchange(&s_restart, 0) != 0;     // 原子取出：读后清会被并发请求吞掉
 }
 
 // 运行时换分辨率：驱动自己会 停流→probe/commit→重启，不关设备。
@@ -206,11 +202,15 @@ esp_err_t uvc_capture_open(void)
     uvc_host_stream_hdl_t stream = NULL;
     esp_err_t err = uvc_host_stream_open(&s_stream_cfg, pdMS_TO_TICKS(5000), &stream);
     if (err != ESP_OK && s_cap_fps) {
-        // 卡没有这个帧率档（驱动用 fabsf 精确匹配 descriptor）→ 退回卡的默认帧率，
-        // 别把流丢在打不开的状态（否则 5s 重试循环里永远出不了画面）
+        // 卡没有这个帧率档（驱动用 fabsf 精确匹配 descriptor）→ 本次退回卡的默认帧率，
+        // 别把流丢在打不开的状态（否则 5s 重试循环里永远出不了画面）。
+        // 只改本次用的 vs_format，不动 s_cap_fps：回退是粘性兼容值，不是新期望值 ——
+        // 不然 stall 自愈/拔插重开就永久丢掉 30fps 档，1080P 白烧双倍 USB/PSRAM 带宽
         ESP_LOGW(TAG, "no %u fps mode (%s), retry at card default", s_cap_fps, esp_err_to_name(err));
-        uvc_capture_set_format(s_stream_cfg.vs_format.h_res, s_stream_cfg.vs_format.v_res, 0);
+        uint8_t save = s_stream_cfg.vs_format.fps;
+        s_stream_cfg.vs_format.fps = 0;
         err = uvc_host_stream_open(&s_stream_cfg, pdMS_TO_TICKS(5000), &stream);
+        s_stream_cfg.vs_format.fps = save;
     }
     if (err != ESP_OK) {
         usb_host_lib_info_t info;

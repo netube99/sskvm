@@ -27,12 +27,11 @@ void video_pipeline_force_idr(void);
 
 // 分辨率：索引 0=480P 1=720P 2=1080P（表在 video_pipeline.c）
 int video_pipeline_res(void);
-int video_pipeline_res_count(void);
 const char *video_pipeline_res_name(int idx);
 void video_pipeline_res_dims(int idx, uint16_t *w, uint16_t *h);
 uint16_t video_pipeline_width(void);
 uint16_t video_pipeline_height(void);
-// 切换分辨率：异步执行（重建编码器/缓冲、重开 UVC 流）
+// 切换分辨率：异步执行（重建编码器、原地 format_select 换 UVC 流格式）
 esp_err_t video_pipeline_set_resolution(int idx);
 
 // 分辨率是否正在重建；编码成功帧数；IDR 帧数；让管线整套重建（编码任务卡死时）
