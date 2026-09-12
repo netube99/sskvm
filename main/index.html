@@ -16,6 +16,7 @@
   #cv { display: block; background: #000; cursor: crosshair; }
 
   #foot { padding: 26px 8px 6px; }
+  #topline { display: flex; align-items: center; gap: 6px; }
   #brand { display: inline-block; color: #fff; text-decoration: none; padding: 0 4px;
            font: 700 18px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans SC", sans-serif;
            letter-spacing: .04em; }
@@ -26,8 +27,8 @@
   #dot { color: #c00; }
   #dot.ok { color: #0c0; }
   #hud { color: #777; }
-  #menuBtn { background: none; border: 0; color: #999; cursor: pointer; font: inherit; padding: 0 2px; }
-  #menuBtn:hover { color: #fff; }
+  #menuBtn, #shotBtn { background: none; border: 0; color: #999; cursor: pointer; font: inherit; padding: 0 2px; }
+  #menuBtn:hover, #shotBtn:hover { color: #fff; }
 
   /* 覆盖层：连接中 / 无信号 / 被占用 / 认证失败（画面区域之上，不挡底栏） */
   #overlay { position: fixed; inset: 0 0 74px 0; display: none; align-items: center;
@@ -70,6 +71,7 @@
   dt { color: #999; }
   dd { margin: 0; }
   #hint { margin: 12px 0 0; min-height: 1.4em; color: #999; font-size: 12px; }
+  #uvcHint { align-self: center; color: #999; font-size: 12px; }
   button:focus, a:focus, input:focus { outline: none; }
 </style>
 </head>
@@ -78,11 +80,14 @@
   <div id="box">
     <canvas id="cv" width="1280" height="720"></canvas>
     <div id="foot">
-      <a id="brand" href="https://github.com/netube99/sskvm" target="_blank" rel="noopener noreferrer">SSKVM</a>
+      <div id="topline">
+        <a id="brand" href="https://github.com/netube99/sskvm" target="_blank" rel="noopener noreferrer">SSKVM</a>
+        <button id="menuBtn">设置</button>
+        <button id="shotBtn">截图</button>
+      </div>
       <div id="status">
         <span id="conn"><span id="dot">●</span> <span id="connText">连接中…</span></span>
         <span id="hud"></span>
-        <button id="menuBtn">设置</button>
       </div>
     </div>
   </div>
@@ -113,9 +118,10 @@
       </div>
     </div>
     <div class="row">
-      <label>采集卡</label>
+      <label>IPKVM</label>
       <div class="inline">
-        <button class="act" id="restartUvc">重启采集卡</button>
+        <button class="act" id="restartUvc">重启</button>
+        <span id="uvcHint"></span>
       </div>
     </div>
     <dl>
@@ -580,28 +586,61 @@ document.getElementById('saveHost').onclick = async () => {
   hint.textContent = r.ok ? '已保存' : ('失败：' + await r.text());
 };
 
+const uvcHint = document.getElementById('uvcHint');
+
 document.getElementById('restartUvc').onclick = async () => {
-  hint.textContent = '正在重启采集卡…';
+  uvcHint.textContent = '正在重启…';
   try {
     const r = await fetch('/config', {
       method: 'POST',
       headers: TOKEN ? { 'X-Auth-Token': TOKEN } : {},
       body: 'uvc=restart',
     });
-    hint.textContent = r.ok ? '已重启，画面几秒后恢复' : ('失败：' + await r.text());
+    uvcHint.textContent = r.ok ? '已重启，画面几秒后恢复' : ('失败：' + await r.text());
   } catch (e) {
-    hint.textContent = '失败：连接断开';
+    uvcHint.textContent = '失败：连接断开';
   }
 };
 
 document.getElementById('menuBtn').onclick = () => {
   releaseAll();                             // 面板打开后不再转发输入
   hint.textContent = '';
+  uvcHint.textContent = '';
   menu.showModal();
   document.getElementById('host').focus();  // 焦点别停在关闭按钮上（Enter 会误关弹窗）
 };
 document.getElementById('closeMenu').onclick = () => menu.close();
 menu.addEventListener('keydown', e => { if (e.key === 'Enter') e.preventDefault(); });
+
+// ---------------- 截图 ----------------
+document.getElementById('shotBtn').onclick = async () => {
+  const btn = document.getElementById('shotBtn');
+  btn.disabled = true;
+  try {
+    let r = null;
+    for (let i = 0; i < 6; i++) {           // 冷态先 404 预热，间隔重试
+      r = await fetch('/snapshot.jpg', { headers: TOKEN ? { 'X-Auth-Token': TOKEN } : {} });
+      if (r.ok) break;
+      await new Promise(s => setTimeout(s, 350));
+    }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const url = URL.createObjectURL(await r.blob());
+    const d = new Date(), p = n => String(n).padStart(2, '0');
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `sskvm-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-` +
+                 `${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.jpg`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  } catch (e) {
+    btn.textContent = '失败';
+    setTimeout(() => { btn.textContent = '截图'; }, 2000);
+  } finally {
+    btn.disabled = false;
+  }
+};
 
 // ---------------- 覆盖层按钮 ----------------
 ovBtn.onclick = () => {
