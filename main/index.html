@@ -61,6 +61,7 @@
                color: #ddd; cursor: pointer; font: 12px/1.6 inherit; }
   button.act:hover { background: #2a2a2a; }
   button[disabled] { opacity: .4; cursor: default; }
+  #wol { width: 19ch; }   /* 17 字符的 aa:bb:cc:dd:ee:ff 放得下 */
   .seg { display: inline-flex; }
   .seg button { padding: 6px 18px; background: none; border: 0; color: #999; cursor: pointer;
                 font: 13px/1.6 inherit; }
@@ -122,6 +123,14 @@
       <div class="inline">
         <button class="act" id="restartUvc">重启</button>
         <span id="uvcHint"></span>
+      </div>
+    </div>
+    <div class="row">
+      <label for="wol">网络唤醒 MAC</label>
+      <div class="inline">
+        <input id="wol" autocomplete="off" spellcheck="false" placeholder="aa:bb:cc:dd:ee:ff">
+        <button class="act" id="saveWol">记忆</button>
+        <button class="act" id="wakeBtn">唤醒</button>
       </div>
     </div>
     <dl>
@@ -609,6 +618,7 @@ resBtns.forEach(b => b.onclick = () => {
 
 function updateInfo(c) {
   if (c.hostname) document.getElementById('host').value = c.hostname;
+  if (c.wol !== undefined) document.getElementById('wol').value = c.wol;
   document.getElementById('vIp').textContent = c.ip || '-';
   document.getElementById('vMac').textContent = c.mac || '-';
   document.getElementById('vVer').textContent = c.version || '-';
@@ -627,6 +637,33 @@ document.getElementById('saveHost').onclick = async () => {
 };
 
 const uvcHint = document.getElementById('uvcHint');
+
+// 记忆：把输入框里的 MAC 存进设备 NVS（空 = 清除）；唤醒：对记住的 MAC 发 UDP 广播
+document.getElementById('saveWol').onclick = async () => {
+  const mac = document.getElementById('wol').value.trim();
+  const r = await fetch('/config', {
+    method: 'POST',
+    headers: TOKEN ? { 'X-Auth-Token': TOKEN } : {},
+    cache: 'no-store',
+    body: 'wol=' + mac,
+  });
+  const t = await r.text();
+  if (r.ok) document.getElementById('wol').value = t === 'ok' ? mac.toLowerCase() : mac;
+  hint.textContent = r.ok ? (mac ? '已记住 MAC' : '已清除') : ('失败：' + t);
+};
+
+document.getElementById('wakeBtn').onclick = async () => {
+  try {
+    const r = await fetch('/wol', {
+      method: 'POST',
+      headers: TOKEN ? { 'X-Auth-Token': TOKEN } : {},
+      cache: 'no-store',
+    });
+    hint.textContent = r.ok ? '已发送唤醒包，开机约需几十秒' : ('失败：' + await r.text());
+  } catch (e) {
+    hint.textContent = '失败：连接断开';
+  }
+};
 
 document.getElementById('restartUvc').onclick = async () => {
   uvcHint.textContent = '正在重启…';

@@ -22,10 +22,12 @@ static const char *TAG = "config";
 #define K_GW        "static_gw"
 #define K_MASK      "static_mask"
 #define K_RES       "res"
+#define K_WOL       "wol_mac"
 
 static char s_hostname[33];
 static char s_token[65];
 static char s_ip[16], s_gw[16], s_mask[16];
+static char s_wol[18];
 static uint8_t s_res;
 
 #if defined(CONFIG_SSKVM_RES_480P)
@@ -65,6 +67,7 @@ esp_err_t kvm_config_init(void)
         snprintf(s_token, sizeof(s_token), "%s", CONFIG_SSKVM_AUTH_TOKEN);
         s_res = DEFAULT_RES;
         s_ip[0] = s_gw[0] = s_mask[0] = 0;
+        s_wol[0] = 0;
         ESP_LOGI(TAG, "first boot: hostname=%s", s_hostname);
         return ESP_OK;
     }
@@ -73,6 +76,7 @@ esp_err_t kvm_config_init(void)
     load_str(h, K_IP, s_ip, sizeof(s_ip), "");
     load_str(h, K_GW, s_gw, sizeof(s_gw), "");
     load_str(h, K_MASK, s_mask, sizeof(s_mask), "");
+    load_str(h, K_WOL, s_wol, sizeof(s_wol), "");
     s_res = DEFAULT_RES;
     nvs_get_u8(h, K_RES, &s_res);
     nvs_close(h);
@@ -148,5 +152,71 @@ esp_err_t kvm_config_set_token(const char *token)
     ESP_RETURN_ON_ERROR(save_str(K_TOKEN, token), TAG, "save");
     snprintf(s_token, sizeof(s_token), "%s", token);
     ESP_LOGI(TAG, "token %s", s_token[0] ? "set" : "cleared");
+    return ESP_OK;
+}
+
+// MAC 文本 → 6 字节：冒号/连字符分隔（每段 2 个 hex）或裸 12 hex，大小写随意。
+// 分隔必须整齐（全有 5 个或全无），且恰好 6 字节
+bool kvm_config_parse_mac(const char *s, uint8_t out[6])
+{
+    uint8_t m[6];
+    int n = 0, cnt = 0, v = 0, seps = 0;
+    bool prev_sep = true;
+    for (const char *p = s; *p; p++) {
+        if (*p == ':' || *p == '-') {
+            if (prev_sep || cnt != 0) {          // 连续/开头分隔符、半段就分
+                return false;
+            }
+            seps++;
+            prev_sep = true;
+            continue;
+        }
+        int d;
+        if (*p >= '0' && *p <= '9') {
+            d = *p - '0';
+        } else if (*p >= 'a' && *p <= 'f') {
+            d = *p - 'a' + 10;
+        } else if (*p >= 'A' && *p <= 'F') {
+            d = *p - 'A' + 10;
+        } else {
+            return false;
+        }
+        prev_sep = false;
+        v = (v << 4) | d;
+        if (++cnt == 2) {
+            if (n >= 6) {
+                return false;
+            }
+            m[n++] = (uint8_t)v;
+            v = 0;
+            cnt = 0;
+        }
+    }
+    if (cnt != 0 || n != 6 || (seps != 0 && seps != 5)) {
+        return false;
+    }
+    memcpy(out, m, sizeof(m));
+    return true;
+}
+
+const char *kvm_config_wol_mac(void) { return s_wol; }
+
+esp_err_t kvm_config_set_wol_mac(const char *mac)
+{
+    if (mac[0] == 0) {                       // 空串 = 清除
+        ESP_RETURN_ON_ERROR(save_str(K_WOL, ""), TAG, "save");
+        s_wol[0] = 0;
+        ESP_LOGI(TAG, "wol_mac cleared");
+        return ESP_OK;
+    }
+    uint8_t m[6];
+    ESP_RETURN_ON_FALSE(kvm_config_parse_mac(mac, m), ESP_ERR_INVALID_ARG, TAG,
+                        "bad mac '%s'", mac);
+    char norm[18];
+    snprintf(norm, sizeof(norm), "%02x:%02x:%02x:%02x:%02x:%02x",
+             m[0], m[1], m[2], m[3], m[4], m[5]);
+    ESP_RETURN_ON_ERROR(save_str(K_WOL, norm), TAG, "save");
+    snprintf(s_wol, sizeof(s_wol), "%s", norm);
+    ESP_LOGI(TAG, "wol_mac -> %s", s_wol);
     return ESP_OK;
 }

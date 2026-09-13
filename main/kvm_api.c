@@ -3,7 +3,8 @@
 // 路由：
 //   GET  /              页面（不鉴权：token 错了前端才有机会提示输入 token）
 //   GET  /config        设备状态 JSON
-//   POST /config        res=N / hostname=xxx
+//   POST /config        res=N / hostname=xxx / wol=AA:BB:CC:DD:EE:FF
+//   POST /wol           网络唤醒广播（body 可选 = 目标 MAC，缺省用记住的）
 //   GET  /snapshot.jpg  采集卡原始 JPEG（agent）
 //   POST /input         二进制键鼠事件（agent）
 //   POST /type          ASCII 文本（agent，HID 键盘拆键；非 ASCII 设备端跳过）
@@ -11,6 +12,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <errno.h>
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
@@ -19,6 +22,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
 #include "net_server.h"
 #include "kvm_api.h"
 #include "kvm_config.h"
@@ -354,6 +359,75 @@ static esp_err_t ok_text(net_resp_t *resp, const char *msg)
     return ESP_OK;
 }
 
+// body 尾部的换行/空格（curl/http.client 的习惯动作）去掉再解析
+static void trim_tail(char *s)
+{
+    for (char *e = s + strlen(s); e > s && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ');) {
+        *--e = 0;
+    }
+}
+
+// ---------------- 网络唤醒（WOL） ----------------
+// magic packet = 6×0xFF + 16×目标 MAC，UDP 广播到 255.255.255.255:9。
+// 网卡在 L2 扫广播帧，端口无关紧要（惯例 9 = discard）。发 3 遍：广播偶尔丢包。
+// 目标机网卡必须开了 WOL 且刚关机（软关机 + 待机电源）——我们只负责把包发出去
+static esp_err_t wol_send(const uint8_t mac[6])
+{
+    uint8_t pkt[102];
+    memset(pkt, 0xFF, 6);
+    for (int i = 0; i < 16; i++) {
+        memcpy(pkt + 6 + i * 6, mac, 6);
+    }
+    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ESP_RETURN_ON_FALSE(fd >= 0, ESP_FAIL, TAG, "wol socket");
+    int bc = 1;
+    setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &bc, sizeof(bc));
+    struct sockaddr_in dst = {
+        .sin_family = AF_INET,
+        .sin_port = htons(9),
+        .sin_addr.s_addr = 0xFFFFFFFFu,     // 有限广播：同一二层内必达，不过路由器
+    };
+    esp_err_t ret = ESP_OK;
+    for (int i = 0; i < 3 && ret == ESP_OK; i++) {
+        if (sendto(fd, pkt, sizeof(pkt), 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+            ESP_LOGE(TAG, "wol sendto errno=%d", errno);
+            ret = ESP_FAIL;
+        } else if (i < 2) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+    close(fd);
+    return ret;
+}
+
+// POST /wol：body 空 = 唤醒记住的 MAC；显式给了 MAC 就发那个（agent 临时唤醒别的机器）
+static esp_err_t wol_post(const net_req_t *req, net_resp_t *resp, void *ctx)
+{
+    if (!auth_ok(req)) {
+        return deny(resp);
+    }
+    uint8_t m[6];
+    if (req->body[0]) {
+        char mac[32];
+        snprintf(mac, sizeof(mac), "%s", req->body);
+        trim_tail(mac);
+        if (!kvm_config_parse_mac(mac, m)) {
+            resp->status = 400;
+            return ok_text(resp, "bad mac");
+        }
+    } else if (!kvm_config_parse_mac(kvm_config_wol_mac(), m)) {
+        resp->status = 400;
+        return ok_text(resp, "no mac remembered");
+    }
+    if (wol_send(m) != ESP_OK) {
+        resp->status = 500;
+        return ok_text(resp, "send failed");
+    }
+    ESP_LOGI(TAG, "wol -> %02x:%02x:%02x:%02x:%02x:%02x",
+             m[0], m[1], m[2], m[3], m[4], m[5]);
+    return ok_text(resp, "sent");
+}
+
 // ---------------- 路由 ----------------
 static esp_err_t index_get(const net_req_t *req, net_resp_t *resp, void *ctx)
 {
@@ -374,9 +448,9 @@ static esp_err_t config_get(const net_req_t *req, net_resp_t *resp, void *ctx)
         return ESP_ERR_NO_MEM;
     }
     snprintf(json, req->aux_len,
-             "{\"hostname\":\"%s\",\"ip\":\"%s\",\"mac\":\"%s\",\"version\":\"%s\","
+             "{\"hostname\":\"%s\",\"ip\":\"%s\",\"mac\":\"%s\",\"wol\":\"%s\",\"version\":\"%s\","
              "\"res\":%d,\"resBusy\":%d,\"usb\":%d,\"signal\":%d,\"wsBusy\":%d}",
-             kvm_config_hostname(), eth_net_ip(), eth_net_mac(),
+             kvm_config_hostname(), eth_net_ip(), eth_net_mac(), kvm_config_wol_mac(),
              esp_app_get_description()->version, video_pipeline_res(),
              video_pipeline_res_busy() ? 1 : 0, usb_device_mounted() ? 1 : 0,
              uvc_capture_connected() ? 1 : 0, net_server_ws_busy() ? 1 : 0);
@@ -408,14 +482,22 @@ static esp_err_t config_post(const net_req_t *req, net_resp_t *resp, void *ctx)
     }
     if (strncmp(req->body, "hostname=", 9) == 0) {
         char *v = (char *)req->body + 9;
-        for (char *e = v + strlen(v); e > v && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ');) {
-            *--e = 0;
-        }
+        trim_tail(v);
         if (kvm_config_set_hostname(v) != ESP_OK) {
             resp->status = 400;
             return ok_text(resp, "hostname: 1..32 chars [a-z0-9-]");
         }
         kvm_mdns_set_hostname(v);
+        return ok_text(resp, "ok");
+    }
+    if (strncmp(req->body, "wol=", 4) == 0) {
+        // 设置页「记忆」按钮：记住目标机 MAC（空串 = 清除）；重启后仍在
+        char *v = (char *)req->body + 4;
+        trim_tail(v);
+        if (kvm_config_set_wol_mac(v) != ESP_OK) {
+            resp->status = 400;
+            return ok_text(resp, "bad mac");
+        }
         return ok_text(resp, "ok");
     }
     if (strncmp(req->body, "uvc=restart", 11) == 0) {
@@ -424,7 +506,7 @@ static esp_err_t config_post(const net_req_t *req, net_resp_t *resp, void *ctx)
         return ok_text(resp, "restarting");
     }
     resp->status = 400;
-    return ok_text(resp, "res= / hostname= / uvc=restart");
+    return ok_text(resp, "res= / hostname= / wol= / uvc=restart");
 }
 
 #define SNAP_COPY_MAX (2 * 1024 * 1024) // 影子缓冲上限（video_pipeline 的 SHADOW_BUF_SIZE）
@@ -499,6 +581,7 @@ esp_err_t kvm_api_start(void)
     ESP_RETURN_ON_ERROR(net_server_add_route("GET", "/snapshot.jpg", snapshot_get, NULL), TAG, "route snap");
     ESP_RETURN_ON_ERROR(net_server_add_route("POST", "/input", input_post, NULL), TAG, "route input");
     ESP_RETURN_ON_ERROR(net_server_add_route("POST", "/type", type_post, NULL), TAG, "route type");
+    ESP_RETURN_ON_ERROR(net_server_add_route("POST", "/wol", wol_post, NULL), TAG, "route wol");
     ESP_RETURN_ON_ERROR(net_server_add_route("GET", "/ws", ws_get, NULL), TAG, "route ws");
     return net_server_start();
 }

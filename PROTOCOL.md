@@ -10,7 +10,8 @@
 |---|---|---|---|
 | GET | `/` | 否 | 单文件前端页面（不鉴权，token 错了页面才有机会提示输入） |
 | GET | `/config` | 是 | 设备状态 JSON |
-| POST | `/config` | 是 | `res=0/1/2`、`hostname=<名字>` 或 `uvc=restart`（重启采集卡流） |
+| POST | `/config` | 是 | `res=0/1/2`、`hostname=<名字>`、`wol=<MAC>`（记网络唤醒目标机 MAC，空串清除）或 `uvc=restart`（重启采集卡流） |
+| POST | `/wol` | 是 | 网络唤醒：对目标 MAC 发 magic packet（UDP 广播 ×3）。body 可选 = 目标 MAC；缺省用已记住的，没记住回 `400 no mac remembered` |
 | GET | `/snapshot.jpg` | 是 | 采集卡原始 JPEG（影子缓冲最近一帧，给 agent；见下） |
 | POST | `/input` | 是 | body = 二进制键鼠事件（见下） |
 | POST | `/type` | 是 | body = ASCII 文本（美式布局，非 ASCII 字符跳过），P4 拆成 HID 按键；队列满返回已收字符数 |
@@ -20,9 +21,13 @@
 
 ```json
 {"hostname":"sskvm-xxxx","ip":"192.168.1.50","mac":"aa:bb:cc:dd:ee:ff",
- "version":"0.1.0","res":1,"resBusy":0,"usb":1,"signal":1,"wsBusy":0}
+ "wol":"11:22:33:44:55:66","version":"0.1.0","res":1,"resBusy":0,
+ "usb":1,"signal":1,"wsBusy":0}
 ```
 
+`wol` 是已记住的网络唤醒目标机 MAC（空串 = 没记）。MAC 文本支持
+`aa:bb:cc:dd:ee:ff` / `aa-bb-cc-dd-ee-ff` / `aabbccddeeff`（大小写随意），设备端统一
+归一成小写冒号形式存 NVS；被控机网卡要开着 WOL 才能被唤醒。
 `res` 0=480P 1=720P 2=1080P；`signal`=0 表示采集卡没在出帧；`wsBusy`=1 表示浏览器已占用。
 `res=` 写入会落 NVS（重启后保持）；首次开机用 Kconfig 默认值，之后一直是最后一次设的值。
 HTTP 响应支持 keep-alive（agent 连续拉图复用一条 TLS 连接），空闲 15s 自动关闭。

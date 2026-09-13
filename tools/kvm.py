@@ -14,6 +14,7 @@
     ./kvm.py <host> wheel <n>                  # 正=向上滚（HID/evdev 惯例）
     ./kvm.py <host> type <text>
     ./kvm.py <host> key <hid_usage>            # 0x28=Enter, 0x04='a'
+    ./kvm.py <host> wol [mac]                  # 网络唤醒（mac 缺省用设备记住的）
 
 token 也可以放环境变量 SSKVM_TOKEN。
 """
@@ -97,6 +98,10 @@ class Kvm:
         time.sleep(hold)
         self._event(bytes([0x01, 0, 0, 0, 0, 0, 0, 0]))
 
+    def wol(self, mac=""):
+        """网络唤醒：设备对目标 MAC 发 UDP 广播。mac 空 = 用设备记住的那个。"""
+        return self._post("/wol", mac.encode(), "text/plain").decode()
+
     def type(self, text):
         """整串丢给 P4（8ms/字符）。P4 队列满会只收下前面一部分，这里续传剩下的。"""
         data = text.encode()
@@ -133,6 +138,8 @@ def main():
         print(k.type(" ".join(args)))
     elif cmd == "key":
         k.key(int(args[0], 0))
+    elif cmd == "wol":
+        print(k.wol(args[0] if args else ""))
     else:
         print(__doc__)
 

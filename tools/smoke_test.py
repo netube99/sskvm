@@ -10,6 +10,7 @@
   4. POST /input 点击不报错
   5. 单次 write 的 POST（头和 body 同一段）：body 首字节不能被吃掉
   6. wss /ws 能收到帧且是 Annex-B（8B 帧头之后是起始码 00 00 01）
+  7. WOL：非法 MAC 拒绝（400）；合法 MAC 发包成功（假 MAC 唤不醒任何机器）
 """
 import base64
 import json
@@ -150,6 +151,12 @@ def main():
     cur = json.loads(k._get("/config"))["res"]
     st, body = post_one_write(HOST, "/config", f"res={cur}", TOKEN)
     check("POST 一次写完 body", b"200" in st and body == b"ok",
+          f"{st.decode(errors='replace')} {body!r}")
+
+    st, body = post_one_write(HOST, "/config", "wol=zz:00:00:00:00:00", TOKEN)
+    check("WOL 非法 MAC 拒绝", b"400" in st, f"{st.decode(errors='replace')} {body!r}")
+    st, body = post_one_write(HOST, "/wol", "02:11:22:33:44:55", TOKEN)
+    check("WOL 发包", b"200" in st and body == b"sent",
           f"{st.decode(errors='replace')} {body!r}")
 
     n, first = ws_h264_frames(HOST, TOKEN)
