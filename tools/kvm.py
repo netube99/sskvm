@@ -15,10 +15,12 @@
     ./kvm.py <host> type <text>
     ./kvm.py <host> key <hid_usage>            # 0x28=Enter, 0x04='a'
     ./kvm.py <host> wol [mac]                  # 网络唤醒（mac 缺省用设备记住的）
+    ./kvm.py <host> ota <sskvm.bin>            # 固件升级：上传后设备校验+重启，自动回退靠 bootloader
 
 token 也可以放环境变量 SSKVM_TOKEN。
 """
 import http.client
+import json
 import os
 import ssl
 import struct
@@ -117,6 +119,37 @@ class Kvm:
             off += n
         return r
 
+    def ota(self, fw):
+        """固件升级：整包 POST /ota（设备流式写入并校验），等它重启回来报新版本。"""
+        try:
+            old = json.loads(self._get("/config"))["version"]
+        except Exception:
+            old = ""
+        with open(fw, "rb") as f:
+            body = f.read()
+        c = self._conn()
+        c.timeout = 180                     # 应答在整包收完+校验后才返回（~1MB 要 ~20s）
+        c.request("POST", self._q("/ota"), body=body,
+                  headers={"Content-Type": "application/octet-stream"})
+        r = c.getresponse()
+        out = r.read()
+        c.close()
+        if r.status != 200:
+            raise RuntimeError(f"POST /ota: HTTP {r.status} {out[:80]!r}")
+        ver = ""
+        for _ in range(60):                 # 设备重启回来（~10s），确认新版本在跑
+            time.sleep(0.5)
+            try:
+                ver = json.loads(self._get("/config"))["version"]
+                break
+            except Exception:
+                pass
+        if not ver:
+            return out.decode(errors="replace") + " (device did not come back in 30s)"
+        if ver != old:
+            return f"ok, running {ver}"
+        return f"done, version unchanged ({ver}: 同版本重刷，或新固件已自动回退)"
+
 
 def main():
     if len(sys.argv) < 3:
@@ -140,6 +173,8 @@ def main():
         k.key(int(args[0], 0))
     elif cmd == "wol":
         print(k.wol(args[0] if args else ""))
+    elif cmd == "ota":
+        print(k.ota(args[0]))
     else:
         print(__doc__)
 

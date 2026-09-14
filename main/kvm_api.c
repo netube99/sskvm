@@ -5,6 +5,7 @@
 //   GET  /config        设备状态 JSON
 //   POST /config        res=N / hostname=xxx / wol=AA:BB:CC:DD:EE:FF
 //   POST /wol           网络唤醒广播（body 可选 = 目标 MAC，缺省用记住的）
+//   POST /ota           固件升级（流式 body = sskvm.bin，校验后重启，见 ota.c）
 //   GET  /snapshot.jpg  采集卡原始 JPEG（agent）
 //   POST /input         二进制键鼠事件（agent）
 //   POST /type          ASCII 文本（agent，HID 键盘拆键；非 ASCII 设备端跳过）
@@ -26,6 +27,7 @@
 #include "lwip/inet.h"
 #include "net_server.h"
 #include "kvm_api.h"
+#include "ota.h"
 #include "kvm_config.h"
 #include "kvm_input.h"
 #include "kvm_mdns.h"
@@ -557,6 +559,17 @@ static esp_err_t type_post(const net_req_t *req, net_resp_t *resp, void *ctx)
     return ok_text(resp, msg);
 }
 
+// POST /ota：固件升级（大 body 走 net_server 的流式路由，ota.c 边收边写 flash）
+static esp_err_t ota_post(const net_req_t *req, size_t total, net_stream_read_t read,
+                          void *rd, net_resp_t *resp, void *ctx)
+{
+    if (!auth_ok(req)) {
+        return deny(resp);
+    }
+    ESP_LOGI(TAG, "ota upload: %uKB", (unsigned)(total / 1024));
+    return ota_upload(total, read, rd, resp);
+}
+
 static esp_err_t ws_get(const net_req_t *req, net_resp_t *resp, void *ctx)
 {
     if (!auth_ok(req)) {
@@ -582,6 +595,7 @@ esp_err_t kvm_api_start(void)
     ESP_RETURN_ON_ERROR(net_server_add_route("POST", "/input", input_post, NULL), TAG, "route input");
     ESP_RETURN_ON_ERROR(net_server_add_route("POST", "/type", type_post, NULL), TAG, "route type");
     ESP_RETURN_ON_ERROR(net_server_add_route("POST", "/wol", wol_post, NULL), TAG, "route wol");
+    ESP_RETURN_ON_ERROR(net_server_set_stream_route("POST", "/ota", ota_post, NULL), TAG, "stream /ota");
     ESP_RETURN_ON_ERROR(net_server_add_route("GET", "/ws", ws_get, NULL), TAG, "route ws");
     return net_server_start();
 }

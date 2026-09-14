@@ -35,6 +35,13 @@ typedef struct {
 
 typedef esp_err_t (*net_handler_t)(const net_req_t *req, net_resp_t *resp, void *ctx);
 
+// 流式上传（body 太大进不了 scratch，边收边喂）：read 由传输层提供，返回 >0 字节数；
+// 0 = 对端超时（该断了）；-1 = 对端关闭/致命错误
+typedef int (*net_stream_read_t)(void *buf, size_t cap, void *rd_ctx);
+typedef esp_err_t (*net_stream_handler_t)(const net_req_t *req, size_t total,
+                                          net_stream_read_t read, void *rd_ctx,
+                                          net_resp_t *resp, void *ctx);
+
 // 以下回调都在该 WS 会话任务里调用（同一线程），可以直接发帧
 typedef struct {
     void (*open)(void *ctx);                        // 升级完成：发全量状态
@@ -48,6 +55,10 @@ bool net_query_get(const char *query, const char *key, char *out, size_t cap);
 
 esp_err_t net_server_start(void);
 esp_err_t net_server_add_route(const char *method, const char *path, net_handler_t cb, void *ctx);
+// 流式路由（当前只有 POST /ota 固件升级）：handler 边读 body 边消费，
+// 应答完连接直接关闭（不 keep-alive，因为 handler 可能没把 body 读干净）
+esp_err_t net_server_set_stream_route(const char *method, const char *path,
+                                      net_stream_handler_t cb, void *ctx);
 void net_server_set_ws(const net_ws_ops_t *ops, void *ctx);
 
 // 只在 WS 回调里调用；会校验调用者就是会话任务，否则返回 ESP_ERR_INVALID_STATE

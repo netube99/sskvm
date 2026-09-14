@@ -11,6 +11,8 @@
   5. 单次 write 的 POST（头和 body 同一段）：body 首字节不能被吃掉
   6. wss /ws 能收到帧且是 Annex-B（8B 帧头之后是起始码 00 00 01）
   7. WOL：非法 MAC 拒绝（400）；合法 MAC 发包成功（假 MAC 唤不醒任何机器）
+  8. OTA：垃圾 body 拒绝（400）且不碰 flash；未授权拒绝（401，配了 token 才测）；
+     129KB 垃圾走完整条流式路径（擦+写+end 校验失败 400，顺带回归流式读取器）
 """
 import base64
 import json
@@ -93,13 +95,13 @@ def ws_h264_frames(host, token, seconds=3):
     return n, first
 
 
-def post_one_write(host, path, body, token=""):
+def post_one_write(host, path, body, token="", timeout=5):
     """头和 body 放同一次 write（curl/fetch 的行为）。
     回归：http_read_request 曾先给头部打 NUL 再拷 body，把 body 首字节写成 0。"""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    s = ctx.wrap_socket(socket.create_connection((host, 443), timeout=5), server_hostname=host)
+    s = ctx.wrap_socket(socket.create_connection((host, 443), timeout=timeout), server_hostname=host)
     b = body.encode() if isinstance(body, str) else body
     hdr = (f"POST {path} HTTP/1.1\r\nHost: {host}:443\r\nContent-Length: {len(b)}\r\n"
            + (f"X-Auth-Token: {token}\r\n" if token else "") + "\r\n").encode()
@@ -157,6 +159,19 @@ def main():
     check("WOL 非法 MAC 拒绝", b"400" in st, f"{st.decode(errors='replace')} {body!r}")
     st, body = post_one_write(HOST, "/wol", "02:11:22:33:44:55", TOKEN)
     check("WOL 发包", b"200" in st and body == b"sent",
+          f"{st.decode(errors='replace')} {body!r}")
+
+    # 垃圾 body 必须 400 且不碰 flash（尺寸检查先于擦除）——这里绝不能真的升级
+    st, body = post_one_write(HOST, "/ota", b"\x00" * 512, TOKEN)
+    check("OTA 拒绝非固件", b"400" in st, f"{st.decode(errors='replace')} {body!r}")
+    if TOKEN:                           # 设备没配 token 时无法测 401
+        st, body = post_one_write(HOST, "/ota", b"\x00" * 512, TOKEN + "wrong")
+        check("OTA 未授权拒绝", b"401" in st, f"{st.decode(errors='replace')} {body!r}")
+
+    # 跨过尺寸门槛的垃圾：走完 流式读取（pre 字节 + 多条 TLS 记录）→ 擦 → 写 → end 校验失败，
+    # 钉住整条流式路径（读取器一旦回归，比如头部 NUL 顶字节，这项会先叫）
+    st, body = post_one_write(HOST, "/ota", b"\x00" * (128 * 1024 + 1024), TOKEN, timeout=40)
+    check("OTA 坏镜像流式拒绝", b"400" in st and b"not a valid app image" in body,
           f"{st.decode(errors='replace')} {body!r}")
 
     n, first = ws_h264_frames(HOST, TOKEN)

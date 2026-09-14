@@ -12,6 +12,7 @@
 | GET | `/config` | 是 | 设备状态 JSON |
 | POST | `/config` | 是 | `res=0/1/2`、`hostname=<名字>`、`wol=<MAC>`（记网络唤醒目标机 MAC，空串清除）或 `uvc=restart`（重启采集卡流） |
 | POST | `/wol` | 是 | 网络唤醒：对目标 MAC 发 magic packet（UDP 广播 ×3）。body 可选 = 目标 MAC；缺省用已记住的，没记住回 `400 no mac remembered` |
+| POST | `/ota` | 是 | 固件升级：body = `idf.py build` 出的 `sskvm.bin` **原样**上传（流式，支持 ~1MB 级）。校验通过回 `200 rebooting` 并自动重启，失败回 4xx/5xx 且旧固件不受影响（见下） |
 | GET | `/snapshot.jpg` | 是 | 采集卡原始 JPEG（影子缓冲最近一帧，给 agent；见下） |
 | POST | `/input` | 是 | body = 二进制键鼠事件（见下） |
 | POST | `/type` | 是 | body = ASCII 文本（美式布局，非 ASCII 字符跳过），P4 拆成 HID 按键；队列满返回已收字符数 |
@@ -21,7 +22,7 @@
 
 ```json
 {"hostname":"sskvm-xxxx","ip":"192.168.1.50","mac":"aa:bb:cc:dd:ee:ff",
- "wol":"11:22:33:44:55:66","version":"0.1.0","res":1,"resBusy":0,
+ "wol":"11:22:33:44:55:66","version":"0.2.0","res":1,"resBusy":0,
  "usb":1,"signal":1,"wsBusy":0}
 ```
 
@@ -34,6 +35,24 @@ HTTP 响应支持 keep-alive（agent 连续拉图复用一条 TLS 连接），�
 
 `POST /config` 的 `uvc=restart`：关掉采集流并按**当前分辨率**重新协商、重开（~1s，WS 不断），
 用于采集卡拔插/抽风后画面异常的软件复位；成功回 `restarting`（异步）。
+
+`POST /ota` 固件升级（设置页「固件升级」或 `tools/kvm.py <host> ota sskvm.bin`）：
+
+- 用 IDF 官方 `esp_ota_*`：写入非运行槽（ota_0/ota_1 轮换）→ `esp_ota_end` 校验镜像
+  → `esp_ota_set_boot_partition` → 重启
+- 尺寸检查先于擦除：`<128KB` 或 > 分区大小回 `400 size is not firmware-like`；已有一个
+  升级在跑回 `409 another upload is running`
+- **镜像校验**：magic（0xE9）在首块写入时即查，坏头部立即回 `400 not a valid app image`；
+  头部合法但内容坏的镜像会走完擦+写后由 `esp_ota_end` 校验拒绝，同样 `400`——两种都不动
+  boot 分区，旧固件不受影响
+- body 没收完（对端断开/超时）回 `400 upload interrupted`
+- **应答时机**：200/400 都在整包收完+校验之后才返回（~1MB 实测 ~16-20s），客户端超时
+  应设 ≥180s（kvm.py 和前端已按此实现）
+- **异常自动回退**（bootloader `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`）：新固件以
+  PENDING_VERIFY 状态启动，设备端在全部模块起来后再撑 3s 才确认（`esp_ota_mark_app_valid_cancel_rollback`）；
+  确认前崩溃/断电/挂死重启，bootloader 自动回退到另一个槽的旧固件。确认后（即正常运行中）的
+  故障不回退——那是两槽镜像的常规语义
+- 升级期间视频/键鼠照常（约卡顿几秒）；重启后浏览器自动重连，`/config` 的 `version` 会变
 
 `/snapshot.jpg` 的语义是**影子缓冲**（agent 高频拉图才热）：
 - 影子超过 300ms 没刷新 → 返回 `404 "no frame yet"` 并预热，**客户端等 ~350ms 重试**即可命中

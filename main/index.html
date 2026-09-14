@@ -40,7 +40,7 @@
   #ovToken { width: 22ch; padding: 6px 8px; background: #000; border: 1px solid #333; color: #ddd;
              outline: none; font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   #ovBtn, #ovSave { padding: 6px 16px; background: #1c1c1c; border: 1px solid #333; color: #ddd;
-                    cursor: pointer; font: 12px/1.6 inherit; }
+                    cursor: pointer; font-family: inherit; font-size: 12px; line-height: 1.6; }
   #ovBtn:hover, #ovSave:hover { background: #2a2a2a; }
 
   dialog { position: relative; padding: 0; border: 1px solid #333; background: #0d0d0d; color: #ddd;
@@ -49,30 +49,38 @@
   #closeMenu { position: absolute; top: 4px; right: 4px; width: 24px; height: 24px;
                background: none; border: 0; color: #999; cursor: pointer; font: 16px/1 sans-serif; }
   #closeMenu:hover { color: #fff; }
-  #menuBody { padding: 20px 24px; }
-  .row { margin-bottom: 14px; }
-  .row label { display: block; margin-bottom: 4px; color: #999; font-size: 12px; }
-  .inline { display: flex; gap: 8px; }
+  #menuBody { padding: 18px 24px 16px; }
+  /* 横向紧凑排版：标签固定宽，内容占满，行内提示自动收缩省略 */
+  .row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .row > label { flex: none; width: 62px; color: #999; font-size: 12px; }
+  .inline { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
   .inline input { width: 16ch; padding: 6px 8px; background: #000; border: 1px solid #333;
                   color: #ddd; outline: none;
                   font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   .inline input:focus { border-color: #666; }
-  button.act { flex: none; padding: 6px 14px; background: #1c1c1c; border: 1px solid #333;
-               color: #ddd; cursor: pointer; font: 12px/1.6 inherit; }
-  button.act:hover { background: #2a2a2a; }
+  .sep { border-top: 1px solid #222; margin: 12px 0; }
+  /* font: Npx/1.6 inherit 是无效简写（CSS 宽关键字不能做家族名组件）会被整条丢弃：
+     button 落回 UA 的 13.3px Arial，label 继承 12px —— 两边高度/字体都不一致。
+     显式写长手属性，家族名明确继承 */
+  button.act, label.act { flex: none; padding: 6px 14px; background: #1c1c1c; border: 1px solid #333;
+                          color: #ddd; cursor: pointer;
+                          font-family: inherit; font-size: 12px; line-height: 1.6; }
+  button.act:hover, label.act:hover { background: #2a2a2a; }
   button[disabled] { opacity: .4; cursor: default; }
   #wol { width: 19ch; }   /* 17 字符的 aa:bb:cc:dd:ee:ff 放得下 */
+  #hint, #uvcHint, #wolHint, #fwHint { flex: 1; min-width: 0; align-self: center; color: #999;
+                                       font-size: 12px; overflow: hidden; text-overflow: ellipsis;
+                                       white-space: nowrap; }
+  #fwName { flex: none; max-width: 180px; overflow: hidden; text-overflow: ellipsis;
+            white-space: nowrap; color: #bbb; font-size: 12px; }
   .seg { display: inline-flex; }
   .seg button { padding: 6px 18px; background: none; border: 0; color: #999; cursor: pointer;
-                font: 13px/1.6 inherit; }
+                font-family: inherit; font-size: 13px; line-height: 1.6; }
   .seg button:hover { color: #ddd; }
   .seg button.on { background: #1c1c1c; color: #fff; }
-  dl { display: grid; grid-template-columns: 72px 1fr; gap: 4px 12px; margin: 18px 0 0;
-       font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  dt { color: #999; }
-  dd { margin: 0; }
-  #hint { margin: 12px 0 0; min-height: 1.4em; color: #999; font-size: 12px; }
-  #uvcHint { align-self: center; color: #999; font-size: 12px; }
+  #info { margin-top: 4px; padding-top: 10px; border-top: 1px solid #222; display: flex; gap: 20px;
+          color: #999; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  #info b { font-weight: normal; color: #ddd; margin-left: 5px; }
   button:focus, a:focus, input:focus { outline: none; }
 </style>
 </head>
@@ -108,16 +116,20 @@
       <div class="inline">
         <input id="host" autocomplete="off" spellcheck="false">
         <button class="act" id="saveHost">修改</button>
+        <span id="hint"></span>
       </div>
     </div>
     <div class="row">
       <label>分辨率</label>
-      <div class="seg" id="resSeg">
-        <button data-res="0">480P</button>
-        <button data-res="1">720P</button>
-        <button data-res="2">1080P</button>
+      <div class="inline">
+        <div class="seg" id="resSeg">
+          <button data-res="0">480P</button>
+          <button data-res="1">720P</button>
+          <button data-res="2">1080P</button>
+        </div>
       </div>
     </div>
+    <div class="sep"></div>
     <div class="row">
       <label>IPKVM</label>
       <div class="inline">
@@ -126,19 +138,29 @@
       </div>
     </div>
     <div class="row">
-      <label for="wol">网络唤醒 MAC</label>
+      <label for="wol">网络唤醒</label>
       <div class="inline">
         <input id="wol" autocomplete="off" spellcheck="false" placeholder="aa:bb:cc:dd:ee:ff">
         <button class="act" id="saveWol">记忆</button>
         <button class="act" id="wakeBtn">唤醒</button>
+        <span id="wolHint"></span>
       </div>
     </div>
-    <dl>
-      <dt>IP</dt><dd id="vIp">-</dd>
-      <dt>MAC</dt><dd id="vMac">-</dd>
-      <dt>版本</dt><dd id="vVer">-</dd>
-    </dl>
-    <p id="hint"></p>
+    <div class="row">
+      <label for="fwFile">固件升级</label>
+      <div class="inline">
+        <label class="act" for="fwFile" id="fwPick">选择固件</label>
+        <input id="fwFile" type="file" accept=".bin" hidden>
+        <span id="fwName"></span>
+        <button class="act" id="fwBtn">上传</button>
+        <span id="fwHint"></span>
+      </div>
+    </div>
+    <div id="info">
+      <span>IP<b id="vIp">-</b></span>
+      <span>MAC<b id="vMac">-</b></span>
+      <span>版本<b id="vVer">-</b></span>
+    </div>
   </div>
 </dialog>
 
@@ -653,15 +675,16 @@ document.getElementById('saveWol').onclick = async () => {
 };
 
 document.getElementById('wakeBtn').onclick = async () => {
+  const wolHint = document.getElementById('wolHint');
   try {
     const r = await fetch('/wol', {
       method: 'POST',
       headers: TOKEN ? { 'X-Auth-Token': TOKEN } : {},
       cache: 'no-store',
     });
-    hint.textContent = r.ok ? '已发送唤醒包，开机约需几十秒' : ('失败：' + await r.text());
+    wolHint.textContent = r.ok ? '已发送唤醒包' : ('失败：' + await r.text());
   } catch (e) {
-    hint.textContent = '失败：连接断开';
+    wolHint.textContent = '失败：连接断开';
   }
 };
 
@@ -680,10 +703,59 @@ document.getElementById('restartUvc').onclick = async () => {
   }
 };
 
+// ---------------- 固件升级（POST /ota 流式上传，设备校验镜像后自行重启） ----------------
+// 原生 file 控件的按钮画风和 .act 不一致：藏掉 input，用同款 label 触发选择（点 label
+// 即开文件对话框），选中后 label 直接显示文件名
+document.getElementById('fwFile').onchange = e => {
+  const f = e.target.files[0];
+  document.getElementById('fwName').textContent = f ? f.name : '';
+};
+
+document.getElementById('fwBtn').onclick = () => {
+  const btn = document.getElementById('fwBtn');
+  const fwHint = document.getElementById('fwHint');
+  const f = document.getElementById('fwFile').files[0];
+  if (!f) {
+    fwHint.textContent = '先选择固件 .bin（idf.py build 的 build/sskvm.bin）';
+    return;
+  }
+  btn.disabled = true;
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/ota');
+  if (TOKEN) xhr.setRequestHeader('X-Auth-Token', TOKEN);
+  xhr.timeout = 180000;
+  xhr.upload.onprogress = e => {
+    if (e.lengthComputable) fwHint.textContent = `上传 ${Math.round(e.loaded * 100 / e.total)}%`;
+  };
+  xhr.onerror = () => {
+    fwHint.textContent = '失败：连接断开';
+    btn.disabled = false;
+  };
+  xhr.ontimeout = () => {
+    fwHint.textContent = '失败：上传超时';
+    btn.disabled = false;
+  };
+  xhr.onload = () => {
+    if (xhr.status === 200) {
+      fwHint.textContent = '校验通过，设备重启中…（页面稍后自动重连）';
+      setStatus('固件升级，设备重启中…', false);
+    } else {
+      fwHint.textContent = '失败：' + (xhr.responseText || `HTTP ${xhr.status}`);
+      btn.disabled = false;
+    }
+  };
+  xhr.send(f);
+};
+
 document.getElementById('menuBtn').onclick = () => {
   releaseAll();                             // 面板打开后不再转发输入
   hint.textContent = '';
   uvcHint.textContent = '';
+  document.getElementById('wolHint').textContent = '';
+  document.getElementById('fwHint').textContent = '';
+  document.getElementById('fwFile').value = '';
+  document.getElementById('fwName').textContent = '';
+  document.getElementById('fwBtn').disabled = false;
   menu.showModal();
   document.getElementById('host').focus();  // 焦点别停在关闭按钮上（Enter 会误关弹窗）
 };

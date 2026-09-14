@@ -68,6 +68,11 @@ static route_t s_routes[MAX_ROUTES];
 static int s_route_n;
 static const net_ws_ops_t *s_ws_ops;
 static void *s_ws_ctx;
+static struct {
+    const char *method, *path;          // 流式路由（最多一条）：POST /ota 固件上传
+    net_stream_handler_t cb;
+    void *ctx;
+} s_stream;
 
 static sess_t s_sess[MAX_SESSIONS];
 static QueueHandle_t s_sess_pool;      // 空闲会话槽
@@ -409,13 +414,12 @@ typedef struct {
     int content_len;
 } hreq_t;
 
-// lines 指向第一行头部（请求行之后），逐行扫描。返回是否找到。
-static bool hdr_get(const char *lines, const char *name, char *out, size_t cap)
+// [p, end) 内逐行扫描头部。有界解析，不依赖 NUL 终止符。返回是否找到。
+static bool hdr_get(const char *p, const char *end, const char *name, char *out, size_t cap)
 {
     size_t nlen = strlen(name);
-    const char *p = lines;
-    while (p && *p) {
-        const char *eol = strstr(p, "\r\n");
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
         if (!eol) {
             break;
         }
@@ -436,12 +440,15 @@ static bool hdr_get(const char *lines, const char *name, char *out, size_t cap)
             out[vlen] = 0;
             return true;
         }
-        p = eol + 2;
+        p = eol + 1;
     }
     return false;
 }
 
-// 返回 1 = 有请求，0 = 对端关闭/超时，-1 = 解析失败（回 400 后关）
+// 流式路由：body 边收边喂给 handler（固件升级）。pre = 已随头部读进来的 body 字节。
+static int run_stream(sess_t *s, hreq_t *h, net_req_t *req, uint8_t *pre, size_t pre_n);
+
+// 返回 1 = 有请求，0 = 对端关闭/超时，-1 = 解析失败（回 400 后关），2 = 流式路由已自行应答
 // first_req：keep-alive 的后续请求等首字节可以放宽（agent 轮询间隔可能比 8s 长）
 static int http_read_request(sess_t *s, hreq_t *h, net_req_t *req, bool first_req)
 {
@@ -493,35 +500,29 @@ static int http_read_request(sess_t *s, hreq_t *h, net_req_t *req, bool first_re
     if (hdr_end < 0) {
         return -1;
     }
-    // 头+body 可能一次读进来（curl/fetch 就是一次 write）：先把 body 挪到独立区域，
-    // 再给头部打 NUL。顺序反了会把 body 首字节写成 0（POST /config 的 res= 永远匹配不上）
     size_t have = total - (size_t)hdr_end;
-    if (have > BODY_MAX) {
-        have = BODY_MAX;                // 超长 body 下面 content_len 检查会拒掉
-    }
-    if (have) {
-        memcpy(body, hdr + hdr_end, have);
-    }
-    hdr[hdr_end] = 0;
 
-    // 请求行
+    // 请求行 + 头部全程有界解析（memchr 到 end），不依赖 NUL 终止符。
+    // 旧版靠给头部打 NUL 终止，那个 NUL 会顶掉紧随其后的 body 首字节
+    // （历史上顺序反了把 body 吃掉，POST /config 永远匹配不上）——整套坑已消灭
+    const char *end = (const char *)hdr + hdr_end;
     char *line = (char *)hdr;
-    char *sp1 = strchr(line, ' ');
+    char *sp1 = memchr(line, ' ', (size_t)(end - line));
     if (!sp1) {
         return -1;
     }
     *sp1 = 0;
     snprintf(h->method, sizeof(h->method), "%.7s", line);
     char *uri = sp1 + 1;
-    char *sp2 = strchr(uri, ' ');
+    char *sp2 = memchr(uri, ' ', (size_t)(end - uri));
     if (!sp2) {
         return -1;
     }
     *sp2 = 0;
-    char *ver = sp2 + 1;                    // "HTTP/1.1\r\n..."
-    char *lines = strchr(ver, '\n');        // 第一行头部
-    lines = lines ? lines + 1 : NULL;
-    char *q = strchr(uri, '?');
+    char *ver = sp2 + 1;                        // "HTTP/1.1\r\n..."
+    char *eol = memchr(ver, '\n', (size_t)(end - ver));
+    char *lines = eol ? eol + 1 : NULL;         // 第一行头部
+    char *q = memchr(uri, '?', (size_t)(sp2 - uri));
     if (q) {
         *q = 0;
         snprintf(h->query, sizeof(h->query), "%.127s", q + 1);
@@ -532,34 +533,54 @@ static int http_read_request(sess_t *s, hreq_t *h, net_req_t *req, bool first_re
     if (!lines) {
         return -1;
     }
+    bool streaming = s_stream.cb && !strcmp(h->method, s_stream.method) &&
+                     !strcmp(h->path, s_stream.path);
 
     // 头部
     char v[64];
-    h->keep_alive = strstr(ver, "HTTP/1.1") != NULL;
-    if (hdr_get(lines, "Connection", v, sizeof(v))) {
+    h->keep_alive = (size_t)(eol - ver) >= 8 && memcmp(ver, "HTTP/1.1", 8) == 0;
+    if (hdr_get(lines, end, "Connection", v, sizeof(v))) {
         if (ci_contains(v, "close")) {
             h->keep_alive = false;
         } else if (ci_contains(v, "keep-alive")) {
             h->keep_alive = true;
         }
     }
-    if (hdr_get(lines, "Upgrade", v, sizeof(v)) && ci_contains(v, "websocket")) {
+    if (hdr_get(lines, end, "Upgrade", v, sizeof(v)) && ci_contains(v, "websocket")) {
         h->ws_upgrade = true;
     }
-    hdr_get(lines, "Sec-WebSocket-Key", h->ws_key, sizeof(h->ws_key));
-    hdr_get(lines, "X-Auth-Token", h->auth_hdr, sizeof(h->auth_hdr));
-    hdr_get(lines, "Host", h->host, sizeof(h->host));
-    hdr_get(lines, "Origin", h->origin, sizeof(h->origin));
+    hdr_get(lines, end, "Sec-WebSocket-Key", h->ws_key, sizeof(h->ws_key));
+    hdr_get(lines, end, "X-Auth-Token", h->auth_hdr, sizeof(h->auth_hdr));
+    hdr_get(lines, end, "Host", h->host, sizeof(h->host));
+    hdr_get(lines, end, "Origin", h->origin, sizeof(h->origin));
     h->content_len = 0;
-    if (hdr_get(lines, "Content-Length", v, sizeof(v))) {
-        h->content_len = atoi(v);
-        if (h->content_len < 0 || h->content_len > BODY_MAX) {
+    if (hdr_get(lines, end, "Content-Length", v, sizeof(v))) {
+        // 严格解析：垃圾/溢出不再被 atoi 静默回绕
+        char *endp = NULL;
+        long cl = strtol(v, &endp, 10);
+        if (*endp != 0 || cl < 0 || cl > 0x7FFFFFF) {
+            return -1;
+        }
+        h->content_len = (int)cl;
+        // 流式路由不做 BODY_MAX 上限（固件 ~1MB 级，另一头有总时限）
+        if (!streaming && h->content_len > BODY_MAX) {
             return -1;
         }
     }
 
+    if (streaming) {
+        // 流式路由忽略 Upgrade 头（/ota 只按普通上传应答；101 只能从 /ws 路由出）
+        return run_stream(s, h, req, hdr + hdr_end, have);
+    }
+
+    // body 可能一次读进来（curl/fetch 就是一次 write）：搬到独立区域，头部区不再动
+    size_t bhave = have > BODY_MAX ? BODY_MAX : have;
+    if (bhave) {
+        memcpy(body, hdr + hdr_end, bhave);
+    }
+
     // body 剩余部分（头部读多了的已经搬过了）。同样受整请求 deadline 约束
-    if (h->content_len > (int)have) {
+    if (h->content_len > (int)bhave) {
         int ms = (int)((deadline - esp_timer_get_time()) / 1000);
         if (ms <= 0) {
             return -1;
@@ -567,7 +588,7 @@ static int http_read_request(sess_t *s, hreq_t *h, net_req_t *req, bool first_re
         if (ms > KEEPALIVE_MS) {
             ms = KEEPALIVE_MS;
         }
-        if (tls_read_full(s, body + have, (size_t)h->content_len - have, ms) <= 0) {
+        if (tls_read_full(s, body + bhave, (size_t)h->content_len - bhave, ms) <= 0) {
             return -1;
         }
     }
@@ -627,6 +648,86 @@ static bool origin_ok(const hreq_t *h)
     snprintf(oh2, sizeof(oh2), "%.*s", (int)strcspn(oh, ":"), oh);
     snprintf(hh2, sizeof(hh2), "%.*s", (int)strcspn(hh, ":"), hh);
     return hh2[0] != 0 && strcasecmp(oh2, hh2) == 0;
+}
+
+// ---------------- 流式上传（固件升级） ----------------
+// 上传总时限/单读空闲时限：独立于普通请求的 REQ_TOTAL_MS（固件 ~1MB 级，还夹着擦分区）
+#define STREAM_TOTAL_MS 120000
+#define STREAM_IDLE_MS  10000
+
+typedef struct {
+    sess_t *s;
+    const uint8_t *pre;                 // 头部那次 read 带进来的 body 字节
+    size_t pre_n, pre_i;
+    size_t left;                        // 距 Content-Length 还差多少
+    int64_t deadline;
+} stream_rd_t;
+
+static int stream_read(void *buf, size_t cap, void *arg)
+{
+    stream_rd_t *r = arg;
+    size_t want = r->left < cap ? r->left : cap;
+    if (want == 0) {
+        return 0;
+    }
+    if (r->pre_i < r->pre_n) {
+        size_t n = r->pre_n - r->pre_i < want ? r->pre_n - r->pre_i : want;
+        memcpy(buf, r->pre + r->pre_i, n);
+        r->pre_i += n;
+        r->left -= n;
+        return (int)n;
+    }
+    int ms = (int)((r->deadline - esp_timer_get_time()) / 1000);
+    if (ms <= 0) {
+        return 0;                       // 总时限到了：对端就是不走完，别陪它
+    }
+    if (ms > STREAM_IDLE_MS) {
+        ms = STREAM_IDLE_MS;
+    }
+    int n = tls_read_some(r->s, buf, want, ms);
+    if (n > 0) {
+        r->left -= n;
+    }
+    return n;
+}
+
+static int run_stream(sess_t *s, hreq_t *h, net_req_t *req, uint8_t *pre, size_t pre_n)
+{
+    net_resp_t resp = { 0 };
+    req->method = h->method;
+    req->path = h->path;
+    req->query = h->query;
+    req->auth_hdr = h->auth_hdr;
+    req->body = "";
+    req->body_len = 0;
+    req->aux = s->aux;
+    req->aux_len = sizeof(s->aux);
+    if (!origin_ok(h)) {
+        ESP_LOGW(TAG, "cross-origin %s %s from origin '%s'", h->method, h->path, h->origin);
+        resp.status = 403;
+        resp.data = (const uint8_t *)"cross origin";
+        resp.len = 12;
+    } else if (h->content_len <= 0) {
+        resp.status = 400;
+        resp.data = (const uint8_t *)"content-length required";
+        resp.len = 22;
+    } else {
+        stream_rd_t rd = {
+            .s = s,
+            .pre = pre,
+            .pre_n = pre_n,
+            .left = (size_t)h->content_len,
+            .deadline = esp_timer_get_time() + (int64_t)STREAM_TOTAL_MS * 1000,
+        };
+        if (s_stream.cb(req, (size_t)h->content_len, stream_read, &rd, &resp, s_stream.ctx) != ESP_OK) {
+            resp.status = resp.status ? resp.status : 500;
+            resp.data = (const uint8_t *)"error";
+            resp.len = 5;
+        }
+    }
+    send_response(s, &resp, false);     // handler 可能没读干净 body，一律用完即关
+    ESP_LOGI(TAG, "%s %s done: HTTP %d", h->method, h->path, resp.status ? resp.status : 200);
+    return 2;
 }
 
 static bool ws_accept_key(const char *key, char *out, size_t cap)
@@ -719,6 +820,9 @@ static void session_task(void *arg)
             net_resp_t err = { .status = 400, .data = (const uint8_t *)"bad request", .len = 11 };
             send_response(s, &err, false);
             break;
+        }
+        if (r == 2) {
+            break;                          // 流式上传已自行应答并关闭连接
         }
 
         net_resp_t resp = { 0 };
@@ -842,6 +946,17 @@ esp_err_t net_server_add_route(const char *method, const char *path, net_handler
 {
     ESP_RETURN_ON_FALSE(s_route_n < MAX_ROUTES, ESP_ERR_NO_MEM, TAG, "routes full");
     s_routes[s_route_n++] = (route_t){ .method = method, .path = path, .cb = cb, .ctx = ctx };
+    return ESP_OK;
+}
+
+esp_err_t net_server_set_stream_route(const char *method, const char *path,
+                                      net_stream_handler_t cb, void *ctx)
+{
+    ESP_RETURN_ON_FALSE(!s_stream.cb, ESP_ERR_INVALID_STATE, TAG, "stream route set");
+    s_stream.method = method;
+    s_stream.path = path;
+    s_stream.cb = cb;
+    s_stream.ctx = ctx;
     return ESP_OK;
 }
 

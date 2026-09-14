@@ -16,6 +16,7 @@
 #include "eth_net.h"
 #include "kvm_mdns.h"
 #include "kvm_api.h"
+#include "ota.h"
 #include "kvm_input.h"
 #include "usb_device.h"
 #include "video_pipeline.h"
@@ -58,6 +59,11 @@ void app_main(void)
 
     // 7. 串口 console：控制 + 压测驱动（res/idr/stat/hid/resloop）
     ESP_ERROR_CHECK(console_start());
+
+    // OTA 新固件的确认点：全部模块起来后再撑 3s 才取消 bootloader 自动回退；
+    // 窗口内崩溃/断电/挂死重启 → 旧固件继续跑（见 ota.c）
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    ota_confirm_if_pending();
 
     uint32_t s = 0;
     while (1) {

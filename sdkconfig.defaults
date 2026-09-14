@@ -7,6 +7,11 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
+# OTA 自动回退：新固件以 PENDING_VERIFY 状态启动，app_main 在启动完成后
+# 确认（esp_ota_mark_app_valid_cancel_rollback）；期间崩了/断电，bootloader
+# 自动回退到另一个槽的旧固件（main/ota.c）
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
 # 复合设备：HID 键盘 + 绝对鼠标（MSC/CDC 已删）
 CONFIG_TINYUSB_CDC_ENABLED=n
 CONFIG_TINYUSB_MSC_ENABLED=n
@@ -60,9 +65,8 @@ CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
 CONFIG_LWIP_TCP_WND_DEFAULT=16384
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 
-# 大帧走 TLS：默认 4KB 记录会把 30KB 的帧拆成 8 条 TLS 记录
-CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
-# 收只收键鼠/HTTP 请求（≤1KB），收缓冲降到 4KB：省 12KB/会话的内部 RAM，
-# 否则 TLS 缓冲会把内部堆切碎，1080P 编码器要 135KB 连续块就分不到
-CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
+# TLS 记录缓冲必须对称 16KB（IDF 默认）：客户端（浏览器/python）上传大 body 时
+# 会用满 TLS 上限的 16384B 记录，收缓冲不够 = mbedtls "requesting more data than
+# fits" → CORRUPTION_DETECTED（曾把 IN 降到 4096 省内部 RAM，OTA 上传当场炸）
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=16384

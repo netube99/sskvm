@@ -1,5 +1,8 @@
 # Name,   Type, SubType, Offset,  Size, Flags
 nvs,      data, nvs,     0x9000,  0x6000,
 phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 0x200000,
-# 板载 GD25Q128 = 16MB；storage(fat) 分区随 MSC U盘功能一起删除，空间留给未来
+otadata,  data, ota,     0x10000, 0x2000,
+ota_0,    app,  ota_0,   0x20000, 0x200000,
+ota_1,    app,  ota_1,   0x220000,0x200000,
+# factory 槽换成了 ota_0/ota_1 双槽：OTA 写非运行槽 + bootloader 自动回退。
+# nvs/phy 偏移没动，已部署设备的配置不丢；空闲 16MB - 6.13MB 留给未来。

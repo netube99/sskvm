@@ -3,12 +3,12 @@ idf_component_register(SRCS "app_main.c"
                             "usb_device.c" "usb_hid.c"
                             "uvc_capture.c" "video_pipeline.c"
                             "kvm_input.c"
-                            "net_server.c" "kvm_api.c"
+                            "net_server.c" "kvm_api.c" "ota.c"
                             "eth_net.c" "kvm_config.c" "kvm_mdns.c"
                        INCLUDE_DIRS "."
                        PRIV_REQUIRES usb_host_uvc esp_hal_usb esp_timer esp_driver_jpeg esp_driver_uart
                                      esp_eth esp_netif esp_event mbedtls esp-tls mdns
-                                     nvs_flash esp_app_format)
+                                     nvs_flash esp_app_format app_update)
 
 # 自签证书：不提交进仓库，首次 configure 时用 openssl 生成到 main/certs/（已 gitignore）。
 # 想要浏览器不报警告跑 tools/gen_cert.sh <ip>（本地 CA 签，SAN 带 IP）。

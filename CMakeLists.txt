@@ -3,7 +3,7 @@
 cmake_minimum_required(VERSION 3.22)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(sskvm VERSION 0.1.0)
+project(sskvm VERSION 0.2.0)
 
 # lwIP 默认不开 SO_SNDTIMEO（LWIP_SO_SNDTIMEO=0）→ setsockopt 静默失败，send() 对
 # 已经消失的客户端会一直阻塞（TCP 重传要几分钟）。WS 会话任务一旦卡在 send 里，
